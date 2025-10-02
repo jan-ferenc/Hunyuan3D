@@ -66,19 +66,19 @@ class Hunyuan3DPaintPipeline:
                 try:
                     import huggingface_hub
                     # download from huggingface
+                    allow_patterns = [
+                        "hunyuan3d-delight-v2-0/*",
+                        "hunyuan3d-delight-v2-0/**",
+                        f"{subfolder}/*",
+                        f"{subfolder}/**",
+                        f"{subfolder}/**/*",
+                    ]
                     model_path = huggingface_hub.snapshot_download(
                         repo_id=original_model_path,
-                        allow_patterns=[
-                            "hunyuan3d-delight-v2-0/*",
-                            "hunyuan3d-delight-v2-0/**",
-                        ],
-                    )
-                    model_path = huggingface_hub.snapshot_download(
-                        repo_id=original_model_path,
-                        allow_patterns=[
-                            f"{subfolder}/*",
-                            f"{subfolder}/**",
-                        ],
+                        allow_patterns=allow_patterns,
+                        local_dir=None,
+                        local_dir_use_symlinks=False,
+                        resume_download=True,
                     )
                     delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
                     multiview_model_path = os.path.join(model_path, subfolder)
