@@ -41,8 +41,8 @@ class Hunyuan3DTexGenConfig:
         self.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
         self.candidate_view_weights = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
 
-        self.render_size = 2048
-        self.texture_size = 2048
+        self.render_size = 512
+        self.texture_size = 512
         self.bake_exp = 4
         self.merge_method = 'fast'
 

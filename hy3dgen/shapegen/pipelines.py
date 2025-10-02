@@ -205,9 +205,25 @@ class Hunyuan3DDiTPipeline:
         dtype=torch.float16,
         use_safetensors=True,
         variant='fp16',
-        subfolder='hunyuan3d-dit-v2-0',
+        subfolder=None,
+        enable_flashvdm=True,
         **kwargs,
     ):
+        model_name = model_path.split('/')[-1]
+        if subfolder is None:
+            subfolder_mapping = {
+                'Hunyuan3D-2': 'hunyuan3d-dit-v2-0',
+                'Hunyuan3D-2mv': 'hunyuan3d-dit-v2-0',
+                'Hunyuan3D-2mini': 'hunyuan3d-dit-v2-mini-turbo',
+            }
+            subfolder = subfolder_mapping.get(model_name)
+            if subfolder is None:
+                name_lower = model_name.lower()
+                if 'mini' in name_lower:
+                    subfolder = 'hunyuan3d-dit-v2-mini-turbo'
+                else:
+                    subfolder = 'hunyuan3d-dit-v2-0'
+
         kwargs['from_pretrained_kwargs'] = dict(
             model_path=model_path,
             subfolder=subfolder,
@@ -222,7 +238,7 @@ class Hunyuan3DDiTPipeline:
             use_safetensors=use_safetensors,
             variant=variant
         )
-        return cls.from_single_file(
+        pipeline = cls.from_single_file(
             ckpt_path,
             config_path,
             device=device,
@@ -230,6 +246,9 @@ class Hunyuan3DDiTPipeline:
             use_safetensors=use_safetensors,
             **kwargs
         )
+        if enable_flashvdm:
+            pipeline.enable_flashvdm()
+        return pipeline
 
     def __init__(
         self,
@@ -649,10 +668,10 @@ class Hunyuan3DDiTPipeline:
         self,
         latents,
         output_type='trimesh',
-        box_v=1.01,
+        box_v=0.9,
         mc_level=0.0,
         num_chunks=20000,
-        octree_resolution=256,
+        octree_resolution=192,
         mc_algo='mc',
         enable_pbar=True
     ):
@@ -683,14 +702,14 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
     def __call__(
         self,
         image: Union[str, List[str], Image.Image, dict, List[dict]] = None,
-        num_inference_steps: int = 50,
+        num_inference_steps: int = 4,
         timesteps: List[int] = None,
         sigmas: List[float] = None,
         eta: float = 0.0,
-        guidance_scale: float = 5.0,
+        guidance_scale: float = 3.0,
         generator=None,
-        box_v=1.01,
-        octree_resolution=384,
+        box_v=0.9,
+        octree_resolution=192,
         mc_level=0.0,
         mc_algo=None,
         num_chunks=8000,

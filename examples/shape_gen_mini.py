@@ -14,15 +14,16 @@ if image.mode == 'RGB':
 
 pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
     'tencent/Hunyuan3D-2mini',
-    subfolder='hunyuan3d-dit-v2-mini',
     variant='fp16'
 )
 
 start_time = time.time()
 mesh = pipeline(
     image=image,
-    num_inference_steps=50,
-    octree_resolution=380,
+    num_inference_steps=4,
+    guidance_scale=3.0,
+    box_v=0.9,
+    octree_resolution=192,
     num_chunks=20000,
     generator=torch.manual_seed(12345),
     output_type='trimesh'

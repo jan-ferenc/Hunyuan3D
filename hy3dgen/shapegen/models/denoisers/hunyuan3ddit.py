@@ -22,12 +22,16 @@ from einops import rearrange
 from torch import Tensor, nn
 
 scaled_dot_product_attention = nn.functional.scaled_dot_product_attention
-if os.environ.get('USE_SAGEATTN', '0') == '1':
+_sage_env = os.environ.get('USE_SAGEATTN')
+_prefer_sage = _sage_env != '0'
+if _prefer_sage:
     try:
         from sageattention import sageattn
     except ImportError:
-        raise ImportError('Please install the package "sageattention" to use this USE_SAGEATTN.')
-    scaled_dot_product_attention = sageattn
+        if _sage_env == '1':
+            raise ImportError('Please install the package "sageattention" to use USE_SAGEATTN=1.')
+    else:
+        scaled_dot_product_attention = sageattn
 
 
 def attention(q: Tensor, k: Tensor, v: Tensor, **kwargs) -> Tensor:
