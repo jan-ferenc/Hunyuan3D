@@ -79,6 +79,8 @@ class Hunyuan3DPaintPipeline:
                         local_dir=None,
                         local_dir_use_symlinks=False,
                         resume_download=True,
+                        force_download=True,
+                        revision='main',
                     )
                     delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
                     multiview_model_path = os.path.join(model_path, subfolder)
