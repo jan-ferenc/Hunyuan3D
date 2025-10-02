@@ -58,7 +58,7 @@ class Multiview_Diffusion_Net():
                     'Aligning UNet class identity with %s',
                     unet_mod.__name__ if unet_mod else 'expected module',
                 )
-                setattr(unet_mod, 'UNet2p5DConditionModel', current_cls)
+                pipeline.unet.__class__ = expected_unet_cls
             else:
                 unet_path = os.path.join(multiview_ckpt_path, 'unet')
                 dtype = getattr(pipeline.unet, 'dtype', torch.float16)
