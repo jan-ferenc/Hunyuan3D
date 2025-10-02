@@ -34,6 +34,7 @@ accelerate
 gradio
 fastapi
 uvicorn
+google-genai
 rembg
 onnxruntime
 #gevent
