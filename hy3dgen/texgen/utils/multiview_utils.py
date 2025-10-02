@@ -21,6 +21,8 @@ from typing import List
 from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, LCMScheduler
 
+from ..hunyuanpaint.unet.modules import UNet2p5DConditionModel
+
 
 class Multiview_Diffusion_Net():
     def __init__(self, config) -> None:
@@ -33,19 +35,23 @@ class Multiview_Diffusion_Net():
 
         pipeline = DiffusionPipeline.from_pretrained(
             multiview_ckpt_path,
-            custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16)
+            custom_pipeline=custom_pipeline_path,
+            torch_dtype=torch.float16,
+        )
 
         if not isinstance(pipeline.unet, UNet2p5DConditionModel):
             unet_path = os.path.join(multiview_ckpt_path, 'unet')
+            dtype = getattr(pipeline.unet, 'dtype', torch.float16)
+            device = pipeline.device
             try:
                 pipeline.unet = UNet2p5DConditionModel.from_pretrained(
                     unet_path,
-                    torch_dtype=pipeline.unet.dtype if hasattr(pipeline.unet, 'dtype') else torch.float16,
-                ).to(pipeline.device)
+                    torch_dtype=dtype,
+                ).to(device)
             except Exception:  # pragma: no cover - safety net
                 import traceback
                 traceback.print_exc()
-                raise
+                raise RuntimeError(f"Failed to load 2.5D UNet from {unet_path}")
 
         if config.pipe_name in ['hunyuanpaint']:
             pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config,
