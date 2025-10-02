@@ -45,6 +45,17 @@ class TextureGenerationSettings:
 class GenerationService:
     """Wraps pipelines while reusing decoded imagery."""
 
+    @staticmethod
+    def _tag_mesh_metadata(mesh: trimesh.Trimesh, *, face_target: Optional[int] = None) -> trimesh.Trimesh:
+        metadata = getattr(mesh, 'metadata', None)
+        if metadata is None:
+            mesh.metadata = {}
+        hunyuan_meta = mesh.metadata.setdefault('hunyuan3d', {})
+        hunyuan_meta['standardized'] = True
+        if face_target is not None:
+            hunyuan_meta['face_reduced_to'] = face_target
+        return mesh
+
     def __init__(
         self,
         *,
@@ -119,6 +130,19 @@ class GenerationService:
         )
         return meshes[0]
 
+    def standardize_mesh(
+        self,
+        mesh: trimesh.Trimesh,
+        *,
+        face_count: Optional[int] = None,
+    ) -> trimesh.Trimesh:
+        face_target = face_count or TextureGenerationSettings().face_count
+        mesh = self.float_remover(mesh)
+        mesh = self.degenerate_face_remover(mesh)
+        if face_target:
+            mesh = self.face_reducer(mesh, max_facenum=face_target)
+        return self._tag_mesh_metadata(mesh, face_target=face_target)
+
     def generate_textured_mesh(
         self,
         mesh: trimesh.Trimesh,
@@ -129,7 +153,19 @@ class GenerationService:
             raise RuntimeError("Texture generation is disabled or unavailable (check custom_rasterizer installation)")
         mesh = self.float_remover(mesh)
         mesh = self.degenerate_face_remover(mesh)
-        mesh = self.face_reducer(mesh, max_facenum=settings.face_count)
+
+        metadata = getattr(mesh, 'metadata', {}) or {}
+        hunyuan_meta = metadata.get('hunyuan3d') if isinstance(metadata, dict) else None
+        previously_reduced = None
+        if isinstance(hunyuan_meta, dict):
+            previously_reduced = hunyuan_meta.get('face_reduced_to')
+
+        face_target = settings.face_count
+        if face_target and (previously_reduced is None or previously_reduced > face_target):
+            mesh = self.face_reducer(mesh, max_facenum=face_target)
+            mesh = self._tag_mesh_metadata(mesh, face_target=face_target)
+        else:
+            mesh = self._tag_mesh_metadata(mesh, face_target=previously_reduced)
         if self.texture_pipeline is None:
             raise RuntimeError("Texture pipeline is not initialized")
         return self.texture_pipeline(mesh, image)
