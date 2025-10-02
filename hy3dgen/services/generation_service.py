@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import base64
 import logging
+import os
+import re
 from dataclasses import dataclass
-from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -41,14 +42,6 @@ class ShapeGenerationSettings:
 class TextureGenerationSettings:
     enabled: bool = True
     face_count: int = 40000
-
-
-def mesh_to_base64(mesh: trimesh.Trimesh, file_type: str = 'glb') -> str:
-    buffer = BytesIO()
-    mesh.export(buffer, file_type=file_type)
-    return base64.b64encode(buffer.getvalue()).decode('utf-8')
-
-
 class GenerationService:
     """Wraps pipelines while reusing decoded imagery."""
 
@@ -61,9 +54,17 @@ class GenerationService:
         enable_texture: bool = True,
         shape_model_subfolder: str = 'hunyuan3d-dit-v2-mini-turbo',
         tex_model_subfolder: str = 'hunyuan3d-paint-v2-0-turbo',
+        output_dir: Optional[str] = None,
     ) -> None:
         self.device = device
         self.rembg = BackgroundRemover()
+
+        default_output = Path.cwd() / 'generated_meshes'
+        configured_output = Path(output_dir) if output_dir else Path(
+            os.environ.get('HY3DGEN_OUTPUT_DIR', default_output)
+        )
+        self.output_root = configured_output.resolve()
+        self.output_root.mkdir(parents=True, exist_ok=True)
 
         self.shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
             model_path,
@@ -133,6 +134,25 @@ class GenerationService:
             raise RuntimeError("Texture pipeline is not initialized")
         return self.texture_pipeline(mesh, image)
 
-    @staticmethod
-    def to_base64(mesh: trimesh.Trimesh) -> str:
-        return mesh_to_base64(mesh)
+    def export_mesh(
+        self,
+        mesh: trimesh.Trimesh,
+        job_id: str,
+        *,
+        textured: bool = False,
+        file_type: str = 'glb',
+    ) -> str:
+        sanitized = re.sub(r"[^0-9a-zA-Z_.-]", "_", job_id) or "job"
+        job_dir = self.output_root / sanitized
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = 'textured_mesh' if textured else 'mesh'
+        path = job_dir / f"{filename}.{file_type}"
+
+        export_kwargs = {}
+        if file_type.lower() in {'glb', 'gltf'}:
+            export_kwargs['include_normals'] = textured
+
+        mesh.export(str(path), file_type=file_type, **export_kwargs)
+        logger.info('Saved %s mesh to %s', 'textured' if textured else 'generated', path)
+        return str(path)

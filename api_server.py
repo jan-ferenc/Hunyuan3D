@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from functools import partial
 import json
 import logging
 import logging.handlers
@@ -203,11 +204,14 @@ async def stream_generation(
                 conditioning_image,
                 shape_settings,
             )
-            mesh_base64 = await loop.run_in_executor(None, generation_service.to_base64, mesh)
+            mesh_path = await loop.run_in_executor(
+                None,
+                partial(generation_service.export_mesh, mesh, job_id),
+            )
             yield json.dumps({
                 "event": "mesh",
                 "id": job_id,
-                "mesh_base64": mesh_base64,
+                "mesh_path": mesh_path,
             }) + "\n"
 
             if texture_settings.enabled:
@@ -219,15 +223,19 @@ async def stream_generation(
                         conditioning_image,
                         texture_settings,
                     )
-                    textured_base64 = await loop.run_in_executor(
+                    textured_path = await loop.run_in_executor(
                         None,
-                        generation_service.to_base64,
-                        textured_mesh,
+                        partial(
+                            generation_service.export_mesh,
+                            textured_mesh,
+                            job_id,
+                            textured=True,
+                        ),
                     )
                     yield json.dumps({
                         "event": "textured_mesh",
                         "id": job_id,
-                        "mesh_base64": textured_base64,
+                        "mesh_path": textured_path,
                     }) + "\n"
                 else:
                     yield json.dumps({
