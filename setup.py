@@ -41,6 +41,7 @@ setup(
         'fastapi',
         'uvicorn',
         'rembg',
-        'onnxruntime'
+        'onnxruntime',
+        'google-genai',
     ]
 )

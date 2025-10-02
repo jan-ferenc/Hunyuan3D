@@ -142,7 +142,13 @@ class MeshRender():
 
         self.raster_mode = raster_mode
         if self.raster_mode == 'cr':
-            import custom_rasterizer as cr
+            try:
+                import custom_rasterizer as cr
+            except ImportError as exc:
+                raise ImportError(
+                    "custom_rasterizer extension not found. Install it via "
+                    "'pip install ./hy3dgen/texgen/custom_rasterizer' or run with --disable-texture."
+                ) from exc
             self.raster = cr
         else:
             raise f'No raster named {self.raster_mode}'

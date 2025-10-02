@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Optional
@@ -20,6 +21,9 @@ from hy3dgen.shapegen import (
     FaceReducer,
 )
 from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -73,14 +77,19 @@ class GenerationService:
         self.face_reducer = FaceReducer()
 
         self.texture_enabled = enable_texture and tex_model_path is not None
-        self.texture_pipeline: Optional[Hunyuan3DPaintPipeline]
+        self.texture_pipeline: Optional[Hunyuan3DPaintPipeline] = None
         if self.texture_enabled:
-            self.texture_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
-                tex_model_path,
-                subfolder=tex_model_subfolder,
-            )
-        else:
-            self.texture_pipeline = None
+            try:
+                self.texture_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
+                    tex_model_path,
+                    subfolder=tex_model_subfolder,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Texture pipeline unavailable (%s); continuing with texture generation disabled.",
+                    exc,
+                )
+                self.texture_enabled = False
 
     def prepare_image(self, payload: ImagePayload) -> Image.Image:
         image = payload.as_pil_rgba()
@@ -116,7 +125,7 @@ class GenerationService:
         settings: TextureGenerationSettings,
     ) -> trimesh.Trimesh:
         if not self.texture_enabled or not settings.enabled:
-            raise RuntimeError("Texture generation is disabled")
+            raise RuntimeError("Texture generation is disabled or unavailable (check custom_rasterizer installation)")
         mesh = self.float_remover(mesh)
         mesh = self.degenerate_face_remover(mesh)
         mesh = self.face_reducer(mesh, max_facenum=settings.face_count)
