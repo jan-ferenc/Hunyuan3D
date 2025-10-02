@@ -35,6 +35,18 @@ class Multiview_Diffusion_Net():
             multiview_ckpt_path,
             custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16)
 
+        if not isinstance(pipeline.unet, UNet2p5DConditionModel):
+            unet_path = os.path.join(multiview_ckpt_path, 'unet')
+            try:
+                pipeline.unet = UNet2p5DConditionModel.from_pretrained(
+                    unet_path,
+                    torch_dtype=pipeline.unet.dtype if hasattr(pipeline.unet, 'dtype') else torch.float16,
+                ).to(pipeline.device)
+            except Exception:  # pragma: no cover - safety net
+                import traceback
+                traceback.print_exc()
+                raise
+
         if config.pipe_name in ['hunyuanpaint']:
             pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config,
                                                                              timestep_spacing='trailing')
