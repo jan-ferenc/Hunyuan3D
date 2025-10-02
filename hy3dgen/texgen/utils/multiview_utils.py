@@ -20,6 +20,7 @@ import torch
 from typing import List
 from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, LCMScheduler
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline as BasePipeline
 
 from ..hunyuanpaint.unet.modules import UNet2p5DConditionModel
 
@@ -49,9 +50,10 @@ class Multiview_Diffusion_Net():
                     torch_dtype=dtype,
                 ).to(device)
             except Exception:  # pragma: no cover - safety net
-                import traceback
-                traceback.print_exc()
-                raise RuntimeError(f"Failed to load 2.5D UNet from {unet_path}")
+                logger.exception("Failed to load 2.5D UNet from %s", unet_path)
+                raise RuntimeError(
+                    "Texture pipeline requires UNet2p5DConditionModel; conversion failed."
+                )
 
         if config.pipe_name in ['hunyuanpaint']:
             pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config,
