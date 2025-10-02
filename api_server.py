@@ -158,6 +158,16 @@ def parse_texture_settings(payload: Dict[str, Any]) -> TextureGenerationSettings
         top_level['enabled'] = bool(enabled)
     if 'face_count' in payload:
         top_level['face_count'] = payload['face_count']
+    for key in (
+        'delight_steps',
+        'multiview_steps',
+        'reuse_delighting',
+        'delight_cache_size',
+    ):
+        if key in payload:
+            top_level[key] = payload[key]
+    if 'texture_seed' in payload:
+        top_level['seed'] = payload['texture_seed']
 
     combined = _merge_dicts(TextureGenerationSettings().__dict__, texture_overrides, top_level)
     try:

@@ -23,10 +23,22 @@ def mesh_uv_wrap(mesh):
     if len(mesh.faces) > 500000000:
         raise ValueError("The mesh has more than 500,000,000 faces, which is not supported.")
 
+    metadata = getattr(mesh, 'metadata', {}) or {}
+    hunyuan_meta = metadata.get('hunyuan3d') if isinstance(metadata, dict) else None
+    existing_uv = getattr(getattr(mesh, 'visual', None), 'uv', None)
+    if existing_uv is not None and isinstance(hunyuan_meta, dict) and hunyuan_meta.get('uv_wrapped'):
+        return mesh
+
     vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces)
 
     mesh.vertices = mesh.vertices[vmapping]
     mesh.faces = indices
     mesh.visual.uv = uvs
+
+    if not isinstance(metadata, dict):
+        metadata = {}
+    hunyuan_meta = metadata.setdefault('hunyuan3d', {})
+    hunyuan_meta['uv_wrapped'] = True
+    mesh.metadata = metadata
 
     return mesh

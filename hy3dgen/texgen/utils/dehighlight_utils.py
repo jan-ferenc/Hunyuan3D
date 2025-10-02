@@ -17,6 +17,10 @@ import numpy as np
 import torch
 from PIL import Image
 from diffusers import StableDiffusionInstructPix2PixPipeline, EulerAncestralDiscreteScheduler
+import hashlib
+from collections import OrderedDict
+import threading
+from typing import Optional
 
 
 class Light_Shadow_Remover():
@@ -24,6 +28,11 @@ class Light_Shadow_Remover():
         self.device = config.device
         self.cfg_image = 1.5
         self.cfg_text = 1.0
+        self._cache: "OrderedDict[str, Image.Image]" = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
+        self.default_cache_size = 8
+        self.default_seed = 42
 
         pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
             config.light_remover_ckpt_path,
@@ -32,8 +41,35 @@ class Light_Shadow_Remover():
         )
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config)
         pipeline.set_progress_bar_config(disable=True)
+        try:  # Optional acceleration when xformers is available
+            pipeline.enable_xformers_memory_efficient_attention()
+        except Exception:  # pragma: no cover - best effort, do not fail on missing dependency
+            pass
 
         self.pipeline = pipeline.to(self.device, torch.float16)
+
+    def _make_cache_key(self, image: Image.Image, steps: int, seed: int) -> str:
+        # Hash resized RGBA bytes to avoid redundant pix2pix invocations.
+        data = image.tobytes()
+        digest = hashlib.sha1(data).hexdigest()
+        return f"{image.size[0]}x{image.size[1]}:{steps}:{seed}:{digest}"
+
+    def _get_cached(self, key: str) -> Optional[Image.Image]:
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is None:
+                return None
+            # Preserve LRU order.
+            self._cache.move_to_end(key)
+            return cached.copy()
+
+    def _store_cached(self, key: str, image: Image.Image, *, cache_size: int) -> None:
+        with self._cache_lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = image.copy()
+            while len(self._cache) > cache_size:
+                self._cache.popitem(last=False)
     
     def recorrect_rgb(self, src_image, target_image, alpha_channel, scale=0.95):
         
@@ -66,9 +102,27 @@ class Light_Shadow_Remover():
         return corrected_bgr
 
     @torch.no_grad()
-    def __call__(self, image):
+    def __call__(
+        self,
+        image,
+        *,
+        num_inference_steps: Optional[int] = None,
+        cache_key: Optional[str] = None,
+        use_cache: bool = True,
+        cache_size: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
 
         image = image.resize((512, 512))
+        steps = num_inference_steps or 50
+        runtime_seed = seed if seed is not None else self.default_seed
+        resolved_cache_size = self.default_cache_size if cache_size is None else max(0, int(cache_size))
+        key = None
+        if use_cache and resolved_cache_size > 0:
+            key = cache_key or self._make_cache_key(image, steps, runtime_seed)
+            cached = self._get_cached(key)
+            if cached is not None:
+                return cached
 
         if image.mode == 'RGBA':
             image_array = np.array(image)
@@ -90,21 +144,28 @@ class Light_Shadow_Remover():
 
         image = image.convert('RGB')
 
-        image = self.pipeline(
-            prompt="",
-            image=image,
-            generator=torch.manual_seed(42),
-            height=512,
-            width=512,
-            num_inference_steps=50,
-            image_guidance_scale=self.cfg_image,
-            guidance_scale=self.cfg_text,
-        ).images[0]
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(runtime_seed)
+
+        with self._inference_lock:
+            image = self.pipeline(
+                prompt="",
+                image=image,
+                generator=generator,
+                height=512,
+                width=512,
+                num_inference_steps=steps,
+                image_guidance_scale=self.cfg_image,
+                guidance_scale=self.cfg_text,
+            ).images[0]
 
         image_tensor = torch.tensor(np.array(image)/255.0).to(self.device)
         rgb_src = image_tensor[:,:,:3]
         image = self.recorrect_rgb(rgb_src, rgb_target, alpha)
         image = image[:,:,:3]*image[:,:,3:] + torch.ones_like(image[:,:,:3])*(1.0-image[:,:,3:])
         image = Image.fromarray((image.cpu().numpy()*255).astype(np.uint8))
+
+        if use_cache and key is not None and resolved_cache_size > 0:
+            self._store_cached(key, image, cache_size=resolved_cache_size)
 
         return image

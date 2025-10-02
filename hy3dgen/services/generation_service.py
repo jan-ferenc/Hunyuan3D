@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ from hy3dgen.shapegen import (
     DegenerateFaceRemover,
     FaceReducer,
 )
+from hy3dgen.shapegen.models.autoencoders import SurfaceExtractors
 from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
 
@@ -34,7 +36,7 @@ class ShapeGenerationSettings:
     box_v: float = 0.9
     octree_resolution: int = 192
     num_chunks: int = 20000
-    mc_algo: Optional[str] = 'mc'
+    mc_algo: Optional[str] = None
     seed: Optional[int] = None
 
 
@@ -42,6 +44,22 @@ class ShapeGenerationSettings:
 class TextureGenerationSettings:
     enabled: bool = True
     face_count: int = 40000
+    delight_steps: int = 20
+    multiview_steps: int = 12
+    reuse_delighting: bool = False
+    delight_cache_size: int = 8
+    seed: Optional[int] = 0
+
+    def __post_init__(self) -> None:
+        self.delight_steps = max(1, int(self.delight_steps))
+        self.multiview_steps = max(1, int(self.multiview_steps))
+        self.delight_cache_size = max(0, int(self.delight_cache_size))
+        if isinstance(self.reuse_delighting, str):
+            self.reuse_delighting = self.reuse_delighting.lower() in {"1", "true", "yes", "on"}
+        if self.seed is not None and self.seed != "":
+            self.seed = int(self.seed)
+        else:
+            self.seed = None
 class GenerationService:
     """Wraps pipelines while reusing decoded imagery."""
 
@@ -83,6 +101,11 @@ class GenerationService:
             enable_flashvdm=True,
             subfolder=shape_model_subfolder,
         )
+        # Configure default surface extractor once to avoid repeated deprecation warnings during inference.
+        try:
+            self.shape_pipeline.vae.surface_extractor = SurfaceExtractors['mc']()
+        except Exception:  # pragma: no cover - fallback to diffusers default if configuration fails
+            logger.warning('Unable to configure default surface extractor; continuing with pipeline defaults.', exc_info=True)
 
         self.float_remover = FloaterRemover()
         self.degenerate_face_remover = DegenerateFaceRemover()
@@ -96,6 +119,10 @@ class GenerationService:
                     tex_model_path,
                     subfolder=tex_model_subfolder,
                 )
+                try:
+                    self.texture_pipeline.enable_model_cpu_offload(device=device)
+                except Exception:  # pragma: no cover - permissive setup
+                    logger.warning('Texture pipeline CPU offload skipped (unsupported configuration).', exc_info=True)
             except Exception as exc:
                 logger.warning(
                     "Texture pipeline unavailable (%s); continuing with texture generation disabled.",
@@ -151,14 +178,18 @@ class GenerationService:
     ) -> trimesh.Trimesh:
         if not self.texture_enabled or not settings.enabled:
             raise RuntimeError("Texture generation is disabled or unavailable (check custom_rasterizer installation)")
-        mesh = self.float_remover(mesh)
-        mesh = self.degenerate_face_remover(mesh)
-
         metadata = getattr(mesh, 'metadata', {}) or {}
         hunyuan_meta = metadata.get('hunyuan3d') if isinstance(metadata, dict) else None
         previously_reduced = None
         if isinstance(hunyuan_meta, dict):
             previously_reduced = hunyuan_meta.get('face_reduced_to')
+
+        stage_start = time.perf_counter()
+        if not (isinstance(hunyuan_meta, dict) and hunyuan_meta.get('standardized')):
+            mesh = self.float_remover(mesh)
+            mesh = self.degenerate_face_remover(mesh)
+            mesh = self._tag_mesh_metadata(mesh)
+            logger.debug('Texture preprocessing sanitized mesh in %.3fs', time.perf_counter() - stage_start)
 
         face_target = settings.face_count
         if face_target and (previously_reduced is None or previously_reduced > face_target):
@@ -168,7 +199,19 @@ class GenerationService:
             mesh = self._tag_mesh_metadata(mesh, face_target=previously_reduced)
         if self.texture_pipeline is None:
             raise RuntimeError("Texture pipeline is not initialized")
-        return self.texture_pipeline(mesh, image)
+        runtime_seed = settings.seed if settings.seed is not None else None
+        stage_start = time.perf_counter()
+        textured_mesh = self.texture_pipeline(
+            mesh,
+            image,
+            delight_steps=settings.delight_steps,
+            multiview_steps=settings.multiview_steps,
+            reuse_delighting=settings.reuse_delighting,
+            delight_cache_size=settings.delight_cache_size,
+            seed=runtime_seed,
+        )
+        logger.debug('Texture pipeline completed in %.3fs', time.perf_counter() - stage_start)
+        return textured_mesh
 
     def export_mesh(
         self,

@@ -230,7 +230,17 @@ class Hunyuan3DPaintPipeline:
         return new_image
 
     @torch.no_grad()
-    def __call__(self, mesh, image):
+    def __call__(
+        self,
+        mesh,
+        image,
+        *,
+        delight_steps: int = 50,
+        multiview_steps: int = 30,
+        reuse_delighting: bool = False,
+        delight_cache_size: int = 8,
+        seed: Optional[int] = None,
+    ):
 
         if not isinstance(image, List):
             image = [image]
@@ -242,10 +252,20 @@ class Hunyuan3DPaintPipeline:
             else:
                 image_prompt = image[i]
             images_prompt.append(image_prompt)
-            
+
         images_prompt = [self.recenter_image(image_prompt) for image_prompt in images_prompt]
 
-        images_prompt = [self.models['delight_model'](image_prompt) for image_prompt in images_prompt]
+        delighted_images = []
+        for image_prompt in images_prompt:
+            delighted = self.models['delight_model'](
+                image_prompt,
+                num_inference_steps=delight_steps,
+                use_cache=reuse_delighting,
+                cache_size=delight_cache_size,
+                seed=seed,
+            )
+            delighted_images.append(delighted)
+        images_prompt = delighted_images
 
         mesh = mesh_uv_wrap(mesh)
 
@@ -262,7 +282,13 @@ class Hunyuan3DPaintPipeline:
         camera_info = [(((azim // 30) + 9) % 12) // {-20: 1, 0: 1, 20: 1, -90: 3, 90: 3}[
             elev] + {-20: 0, 0: 12, 20: 24, -90: 36, 90: 40}[elev] for azim, elev in
                        zip(selected_camera_azims, selected_camera_elevs)]
-        multiviews = self.models['multiview_model'](images_prompt, normal_maps + position_maps, camera_info)
+        multiviews = self.models['multiview_model'](
+            images_prompt,
+            normal_maps + position_maps,
+            camera_info,
+            num_inference_steps=multiview_steps,
+            seed=seed,
+        )
 
         for i in range(len(multiviews)):
             # multiviews[i] = self.models['super_model'](multiviews[i])

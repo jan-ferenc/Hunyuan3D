@@ -16,10 +16,11 @@ import os
 import logging
 import random
 import sys
+import threading
 
 import numpy as np
 import torch
-from typing import List
+from typing import List, Optional
 from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, LCMScheduler
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline as BasePipeline
@@ -34,6 +35,9 @@ class Multiview_Diffusion_Net():
         self.device = config.device
         self.view_size = 512
         multiview_ckpt_path = config.multiview_ckpt_path
+        self.default_steps = 30
+        self.default_seed = 0
+        self._inference_lock = threading.Lock()
 
         current_file_path = os.path.abspath(__file__)
         custom_pipeline_path = os.path.join(os.path.dirname(current_file_path), '..', 'hunyuanpaint')
@@ -113,6 +117,10 @@ class Multiview_Diffusion_Net():
             # pipeline.prepare() 
 
         pipeline.set_progress_bar_config(disable=True)
+        try:  # best effort to leverage memory efficient attention when available
+            pipeline.enable_xformers_memory_efficient_attention()
+        except Exception:  # pragma: no cover - optional optimization
+            pass
         self.pipeline = pipeline.to(self.device)
 
     def seed_everything(self, seed):
@@ -121,9 +129,19 @@ class Multiview_Diffusion_Net():
         torch.manual_seed(seed)
         os.environ["PL_GLOBAL_SEED"] = str(seed)
 
-    def __call__(self, input_images, control_images, camera_info):
+    def __call__(
+        self,
+        input_images,
+        control_images,
+        camera_info,
+        *,
+        num_inference_steps: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
 
-        self.seed_everything(0)
+        runtime_seed = self.default_seed if seed is None else seed
+        self.seed_everything(runtime_seed)
+        steps = num_inference_steps or self.default_steps
 
         if not isinstance(input_images, List):
             input_images = [input_images]
@@ -134,7 +152,9 @@ class Multiview_Diffusion_Net():
             if control_images[i].mode == 'L':
                 control_images[i] = control_images[i].point(lambda x: 255 if x > 1 else 0, mode='1')
 
-        kwargs = dict(generator=torch.Generator(device=self.pipeline.device).manual_seed(0))
+        generator = torch.Generator(device=self.pipeline.device)
+        generator.manual_seed(runtime_seed)
+        kwargs = dict(generator=generator)
 
         num_view = len(control_images) // 2
         normal_image = [[control_images[i] for i in range(num_view)]]
@@ -149,7 +169,9 @@ class Multiview_Diffusion_Net():
         kwargs['camera_info_ref'] = camera_info_ref
         kwargs["normal_imgs"] = normal_image
         kwargs["position_imgs"] = position_image
+        kwargs['num_inference_steps'] = steps
 
-        mvd_image = self.pipeline(input_images, num_inference_steps=30, **kwargs).images
+        with self._inference_lock:
+            mvd_image = self.pipeline(input_images, **kwargs).images
 
         return mvd_image
