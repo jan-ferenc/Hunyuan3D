@@ -20,6 +20,13 @@ import torch
 from PIL import Image
 from typing import List, Union, Optional
 
+try:
+    import safetensors.torch
+except ImportError:  # pragma: no cover - optional dependency but expected to be present
+    safetensors = None
+else:
+    safetensors = safetensors.torch
+
 
 from .differentiable_renderer.mesh_render import MeshRender
 from .utils.dehighlight_utils import Light_Shadow_Remover
@@ -82,6 +89,7 @@ class Hunyuan3DPaintPipeline:
                         force_download=True,
                         revision='main',
                     )
+                    cls._ensure_safetensors(model_path, subfolder)
                     delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
                     multiview_model_path = os.path.join(model_path, subfolder)
                     return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder))
@@ -94,8 +102,9 @@ class Hunyuan3DPaintPipeline:
         else:
             delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
             multiview_model_path = os.path.join(model_path, subfolder)
+            cls._ensure_safetensors(model_path, subfolder)
             return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder))
-            
+
     def __init__(self, config):
         self.config = config
         self.models = {}
@@ -116,6 +125,30 @@ class Hunyuan3DPaintPipeline:
     def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "cuda"):
         self.models['delight_model'].pipeline.enable_model_cpu_offload(gpu_id=gpu_id, device=device)
         self.models['multiview_model'].pipeline.enable_model_cpu_offload(gpu_id=gpu_id, device=device)
+    @staticmethod
+    def _ensure_safetensors(root_path: str, subfolder: str) -> None:
+        if safetensors is None:
+            logger.warning("safetensors not available; skipping .bin to .safetensors conversion")
+            return
+
+        targets = [
+            os.path.join(root_path, subfolder, 'vae'),
+            os.path.join(root_path, subfolder, 'unet'),
+        ]
+        for path in targets:
+            if not os.path.isdir(path):
+                continue
+            bin_path = os.path.join(path, 'diffusion_pytorch_model.bin')
+            safetensor_path = os.path.join(path, 'diffusion_pytorch_model.safetensors')
+            if os.path.exists(safetensor_path) or not os.path.exists(bin_path):
+                continue
+            try:
+                logger.info("Converting %s to %s", bin_path, safetensor_path)
+                weights = torch.load(bin_path, map_location='cpu')
+                safetensors.save_file(weights, safetensor_path)
+            except Exception:  # pragma: no cover - safeguard
+                logger.exception("Failed converting %s to safetensors", bin_path)
+
 
     def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True):
         normal_maps = []
