@@ -15,6 +15,7 @@
 import os
 import logging
 import random
+import sys
 
 import numpy as np
 import torch
@@ -37,11 +38,38 @@ class Multiview_Diffusion_Net():
         current_file_path = os.path.abspath(__file__)
         custom_pipeline_path = os.path.join(os.path.dirname(current_file_path), '..', 'hunyuanpaint')
 
-        pipeline = DiffusionPipeline.from_pretrained(
-            multiview_ckpt_path,
-            custom_pipeline=custom_pipeline_path,
-            torch_dtype=torch.float16,
-        )
+        def _load_pipeline():
+            return DiffusionPipeline.from_pretrained(
+                multiview_ckpt_path,
+                custom_pipeline=custom_pipeline_path,
+                torch_dtype=torch.float16,
+            )
+
+        try:
+            pipeline = _load_pipeline()
+        except (ValueError, TypeError) as load_error:
+            error_message = str(load_error)
+            mismatch_snippet = "Expected types for unet"
+            class_name = "UNet2p5DConditionModel"
+            if mismatch_snippet in error_message and class_name in error_message:
+                expected_module_name = 'diffusers_modules.local.unet.modules'
+                current_module_name = 'diffusers_modules.local.modules'
+                try:
+                    expected_module = sys.modules.get(expected_module_name) or importlib.import_module(expected_module_name)
+                    current_module = sys.modules.get(current_module_name) or importlib.import_module(current_module_name)
+                    expected_cls = getattr(expected_module, class_name, None)
+                    current_cls = getattr(current_module, class_name, None)
+                    if not expected_cls or not current_cls:
+                        raise AttributeError('Missing UNet2p5DConditionModel definitions')
+                    if current_cls is not expected_cls:
+                        setattr(current_module, class_name, expected_cls)
+                        logger.info('Patched diffusers_modules.local.modules.UNet2p5DConditionModel to expected class')
+                    pipeline = _load_pipeline()
+                except Exception:
+                    logger.exception('Failed to reconcile UNet class mismatch during pipeline load')
+                    raise load_error
+            else:
+                raise
 
         # Ensure UNet class identity matches the custom pipeline's runtime module
         try:
