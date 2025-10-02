@@ -25,6 +25,7 @@ import logging.handlers
 import os
 import sys
 import uuid
+import time
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import uvicorn
@@ -172,6 +173,21 @@ def parse_user_query(payload: Dict[str, Any]) -> str:
     return user_query
 
 
+def parse_benchmark_runs(payload: Dict[str, Any]) -> int:
+    raw = payload.get('benchmark_runs')
+    if raw is None:
+        return 1
+    try:
+        runs = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="'benchmark_runs' must be an integer") from exc
+    if runs < 1:
+        raise HTTPException(status_code=400, detail="'benchmark_runs' must be at least 1")
+    if runs > 50:
+        raise HTTPException(status_code=400, detail="'benchmark_runs' must be <= 50")
+    return runs
+
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -187,75 +203,147 @@ async def stream_generation(
     user_query: str,
     shape_settings: ShapeGenerationSettings,
     texture_settings: TextureGenerationSettings,
+    benchmark_runs: int,
 ) -> AsyncGenerator[str, None]:
     if generation_service is None or imagen_client is None or model_semaphore is None:
         raise RuntimeError("Generation service is not initialized")
 
     loop = asyncio.get_running_loop()
+    timing_records = []
 
     async with model_semaphore:
         try:
-            image_payload = await loop.run_in_executor(None, imagen_client.generate, user_query)
-            conditioning_image = await loop.run_in_executor(None, generation_service.prepare_image, image_payload)
+            for run_idx in range(benchmark_runs):
+                run_id = job_id if benchmark_runs == 1 else f"{job_id}-run{run_idx + 1}"
+                run_start = time.perf_counter()
 
-            mesh = await loop.run_in_executor(
-                None,
-                generation_service.generate_mesh,
-                conditioning_image,
-                shape_settings,
-            )
-            mesh = await loop.run_in_executor(
-                None,
-                partial(
-                    generation_service.standardize_mesh,
-                    mesh,
-                    face_count=texture_settings.face_count,
-                ),
-            )
-            mesh_path = await loop.run_in_executor(
-                None,
-                partial(generation_service.export_mesh, mesh, job_id),
-            )
-            yield json.dumps({
-                "event": "mesh",
-                "id": job_id,
-                "mesh_path": mesh_path,
-            }) + "\n"
+                image_payload = await loop.run_in_executor(None, imagen_client.generate, user_query)
+                image_ready = time.perf_counter()
+                conditioning_image = await loop.run_in_executor(None, generation_service.prepare_image, image_payload)
 
-            if texture_settings.enabled:
-                if generation_service.texture_enabled:
-                    textured_mesh = await loop.run_in_executor(
-                        None,
-                        generation_service.generate_textured_mesh,
+                mesh = await loop.run_in_executor(
+                    None,
+                    generation_service.generate_mesh,
+                    conditioning_image,
+                    shape_settings,
+                )
+                mesh = await loop.run_in_executor(
+                    None,
+                    partial(
+                        generation_service.standardize_mesh,
                         mesh,
-                        conditioning_image,
-                        texture_settings,
-                    )
-                    textured_path = await loop.run_in_executor(
-                        None,
-                        partial(
-                            generation_service.export_mesh,
-                            textured_mesh,
-                            job_id,
-                            textured=True,
-                        ),
-                    )
+                        face_count=texture_settings.face_count,
+                    ),
+                )
+                mesh_path = await loop.run_in_executor(
+                    None,
+                    partial(generation_service.export_mesh, mesh, run_id),
+                )
+                mesh_ready = time.perf_counter()
+
+                run_timing: Dict[str, Any] = {
+                    "run": run_idx + 1,
+                    "image_seconds": image_ready - run_start,
+                    "mesh_seconds": mesh_ready - run_start,
+                    "textured_seconds": None,
+                }
+
+                mesh_event = {
+                    "event": "mesh",
+                    "id": run_id,
+                    "mesh_path": mesh_path,
+                    "timings": {
+                        "image_seconds": run_timing["image_seconds"],
+                        "mesh_seconds": run_timing["mesh_seconds"],
+                    },
+                }
+                if benchmark_runs > 1:
+                    mesh_event["run"] = run_idx + 1
+                    mesh_event["runs_total"] = benchmark_runs
+                    mesh_event["parent_job"] = job_id
+                yield json.dumps(mesh_event) + "\n"
+
+                if texture_settings.enabled:
+                    if generation_service.texture_enabled:
+                        textured_mesh = await loop.run_in_executor(
+                            None,
+                            generation_service.generate_textured_mesh,
+                            mesh,
+                            conditioning_image,
+                            texture_settings,
+                        )
+                        textured_path = await loop.run_in_executor(
+                            None,
+                            partial(
+                                generation_service.export_mesh,
+                                textured_mesh,
+                                run_id,
+                                textured=True,
+                            ),
+                        )
+                        textured_ready = time.perf_counter()
+                        run_timing["textured_seconds"] = textured_ready - run_start
+
+                        textured_event = {
+                            "event": "textured_mesh",
+                            "id": run_id,
+                            "mesh_path": textured_path,
+                            "timings": {
+                                "image_seconds": run_timing["image_seconds"],
+                                "mesh_seconds": run_timing["mesh_seconds"],
+                                "textured_seconds": run_timing["textured_seconds"],
+                            },
+                        }
+                        if benchmark_runs > 1:
+                            textured_event["run"] = run_idx + 1
+                            textured_event["runs_total"] = benchmark_runs
+                            textured_event["parent_job"] = job_id
+                        yield json.dumps(textured_event) + "\n"
+                    else:
+                        skipped_event = {
+                            "event": "texture_skipped",
+                            "id": run_id,
+                            "reason": "Texture pipeline disabled",
+                        }
+                        if benchmark_runs > 1:
+                            skipped_event["run"] = run_idx + 1
+                            skipped_event["runs_total"] = benchmark_runs
+                            skipped_event["parent_job"] = job_id
+                        yield json.dumps(skipped_event) + "\n"
+
+                timing_records.append(run_timing.copy())
+
+                if benchmark_runs > 1:
                     yield json.dumps({
-                        "event": "textured_mesh",
-                        "id": job_id,
-                        "mesh_path": textured_path,
-                    }) + "\n"
-                else:
-                    yield json.dumps({
-                        "event": "texture_skipped",
-                        "id": job_id,
-                        "reason": "Texture pipeline disabled",
+                        "event": "run_complete",
+                        "id": run_id,
+                        "run": run_idx + 1,
+                        "runs_total": benchmark_runs,
+                        "parent_job": job_id,
+                        "timings": {
+                            "image_seconds": run_timing["image_seconds"],
+                            "mesh_seconds": run_timing["mesh_seconds"],
+                            "textured_seconds": run_timing["textured_seconds"],
+                        },
                     }) + "\n"
 
-            yield json.dumps({
+            complete_event: Dict[str, Any] = {
                 "event": "complete",
                 "id": job_id,
-            }) + "\n"
+            }
+            if benchmark_runs > 1:
+                averages: Dict[str, float] = {}
+                for key in ("image_seconds", "mesh_seconds", "textured_seconds"):
+                    values = [t[key] for t in timing_records if t.get(key) is not None]
+                    if values:
+                        averages[key] = sum(values) / len(values)
+                complete_event["benchmark"] = {
+                    "runs": benchmark_runs,
+                    "averages": averages,
+                    "per_run": timing_records,
+                }
+
+            yield json.dumps(complete_event) + "\n"
         except Exception as exc:  # pragma: no cover - runtime safeguard
             logger.exception("Generation failed: %s", exc)
             yield json.dumps({
@@ -271,11 +359,18 @@ async def generate(request: Request):
     user_query = parse_user_query(payload)
     shape_settings = parse_shape_settings(payload)
     texture_settings = parse_texture_settings(payload)
+    benchmark_runs = parse_benchmark_runs(payload)
 
     job_id = payload.get('job_id') or str(uuid.uuid4())
-    logger.info("Starting generation job %s", job_id)
+    logger.info("Starting generation job %s (benchmark_runs=%s)", job_id, benchmark_runs)
 
-    stream = stream_generation(job_id, user_query, shape_settings, texture_settings)
+    stream = stream_generation(
+        job_id,
+        user_query,
+        shape_settings,
+        texture_settings,
+        benchmark_runs,
+    )
     return StreamingResponse(stream, media_type="application/x-ndjson")
 
 
