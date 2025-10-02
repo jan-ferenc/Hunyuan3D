@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import os
+import logging
 import random
 
 import numpy as np
@@ -22,7 +23,7 @@ from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, LCMScheduler
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline as BasePipeline
 
-from ..hunyuanpaint.unet.modules import UNet2p5DConditionModel
+logger = logging.getLogger(__name__)
 
 
 class Multiview_Diffusion_Net():
@@ -40,17 +41,25 @@ class Multiview_Diffusion_Net():
             torch_dtype=torch.float16,
         )
 
-        if not isinstance(pipeline.unet, UNet2p5DConditionModel):
+        # Ensure UNet class identity matches the custom pipeline's runtime module
+        try:
+            import importlib
+            unet_mod = importlib.import_module('diffusers_modules.local.unet.modules')
+            ExpectedUNet = getattr(unet_mod, 'UNet2p5DConditionModel')
+        except Exception:
+            ExpectedUNet = None
+        if ExpectedUNet is not None and not isinstance(pipeline.unet, ExpectedUNet):
             unet_path = os.path.join(multiview_ckpt_path, 'unet')
             dtype = getattr(pipeline.unet, 'dtype', torch.float16)
             device = pipeline.device
+            logger.info('Reloading UNet with expected class from %s', unet_mod.__name__)
             try:
-                pipeline.unet = UNet2p5DConditionModel.from_pretrained(
+                pipeline.unet = ExpectedUNet.from_pretrained(
                     unet_path,
                     torch_dtype=dtype,
                 ).to(device)
             except Exception:  # pragma: no cover - safety net
-                logger.exception("Failed to load 2.5D UNet from %s", unet_path)
+                logger.exception("Failed to load expected UNet2p5DConditionModel from %s", unet_path)
                 raise RuntimeError(
                     "Texture pipeline requires UNet2p5DConditionModel; conversion failed."
                 )
