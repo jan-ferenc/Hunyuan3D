@@ -90,7 +90,7 @@ class GenerationService:
 
         try:
             torch.set_float32_matmul_precision("high")
-            if torch.backends.cuda.is_available():
+            if torch.cuda.is_available():
                 torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
         except Exception:  # pragma: no cover - defensive; these flags are best-effort

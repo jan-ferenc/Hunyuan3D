@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import hashlib
+import logging
 import os
 import threading
 from collections import OrderedDict
@@ -29,6 +30,7 @@ class _AtlasWrapper:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._atlas = xatlas.Atlas()
+        self._logger = logging.getLogger(__name__)
         chart_opts = getattr(xatlas, 'ChartOptions', None)
         if callable(chart_opts):
             opts = chart_opts()
@@ -42,30 +44,47 @@ class _AtlasWrapper:
 
     def parametrize(self, vertices: np.ndarray, faces: np.ndarray):
         with self._lock:
-            atlas = self._atlas
-            reset_done = False
-            for method_name in ("clear", "reset", "remove_meshes", "empty"):
-                reset = getattr(atlas, method_name, None)
-                if callable(reset):
-                    try:
-                        reset()
-                        reset_done = True
-                        break
-                    except Exception:
-                        pass
-            if not reset_done:
-                atlas = self._atlas = xatlas.Atlas()
+            try:
+                return self._reuse_atlas(vertices, faces)
+            except Exception:  # pragma: no cover - fall back to stateless API
+                self._logger.debug('Reusable xatlas atlas failed, falling back to parametrize()', exc_info=True)
+                vmapping, indices, uvs = xatlas.parametrize(vertices, faces)
+                return vmapping.copy(), indices.copy(), uvs.copy()
 
-            atlas.add_mesh(vertices, faces)
-            if self._chart_options is not None:
+    def _reuse_atlas(self, vertices: np.ndarray, faces: np.ndarray):
+        atlas = self._atlas
+        reset_done = False
+        for method_name in ("clear", "reset", "remove_meshes", "empty"):
+            reset = getattr(atlas, method_name, None)
+            if callable(reset):
+                reset()
+                reset_done = True
+                break
+        if not reset_done:
+            atlas = self._atlas = xatlas.Atlas()
+
+        atlas.add_mesh(vertices, faces)
+        if self._chart_options is not None:
+            try:
                 atlas.generate(chart_options=self._chart_options)
-            else:
+            except TypeError:
                 atlas.generate()
-            charts_method = getattr(atlas, "get_parameterization", None)
-            if charts_method is None:
-                charts_method = getattr(atlas, "get_result", None)
-            charts = charts_method()
-            return charts.vertex_remap.copy(), charts.indices.copy(), charts.uvs.copy()
+        else:
+            atlas.generate()
+        for method_name in ("get_parameterization", "get_result", "chart_atlas"):
+            charts_method = getattr(atlas, method_name, None)
+            if callable(charts_method):
+                charts = charts_method()
+                break
+        else:
+            charts = atlas
+        if hasattr(charts, "vertex_remap"):
+            vmapping = charts.vertex_remap
+            indices = charts.indices
+            uvs = charts.uvs
+        else:
+            vmapping, indices, uvs = charts
+        return vmapping.copy(), indices.copy(), uvs.copy()
 
 
 _ATLAS = _AtlasWrapper()
