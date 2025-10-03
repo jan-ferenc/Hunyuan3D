@@ -42,13 +42,29 @@ class _AtlasWrapper:
 
     def parametrize(self, vertices: np.ndarray, faces: np.ndarray):
         with self._lock:
-            self._atlas.clear()
-            self._atlas.add_mesh(vertices, faces)
+            atlas = self._atlas
+            reset_done = False
+            for method_name in ("clear", "reset", "remove_meshes", "empty"):
+                reset = getattr(atlas, method_name, None)
+                if callable(reset):
+                    try:
+                        reset()
+                        reset_done = True
+                        break
+                    except Exception:
+                        pass
+            if not reset_done:
+                atlas = self._atlas = xatlas.Atlas()
+
+            atlas.add_mesh(vertices, faces)
             if self._chart_options is not None:
-                self._atlas.generate(chart_options=self._chart_options)
+                atlas.generate(chart_options=self._chart_options)
             else:
-                self._atlas.generate()
-            charts = self._atlas.get_parameterization()
+                atlas.generate()
+            charts_method = getattr(atlas, "get_parameterization", None)
+            if charts_method is None:
+                charts_method = getattr(atlas, "get_result", None)
+            charts = charts_method()
             return charts.vertex_remap.copy(), charts.indices.copy(), charts.uvs.copy()
 
 

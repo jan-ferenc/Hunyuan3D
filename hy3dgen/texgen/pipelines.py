@@ -81,13 +81,15 @@ class Hunyuan3DPaintPipeline:
                         f"{subfolder}/**",
                         f"{subfolder}/**/*",
                     ]
+                    local_cache_dir = os.path.expanduser(os.path.join(base_dir, original_model_path))
+                    os.makedirs(local_cache_dir, exist_ok=True)
                     model_path = huggingface_hub.snapshot_download(
                         repo_id=original_model_path,
                         allow_patterns=allow_patterns,
-                        local_dir=None,
+                        local_dir=local_cache_dir,
                         local_dir_use_symlinks=False,
                         resume_download=True,
-                        force_download=True,
+                        force_download=False,
                         revision='main',
                     )
                     cls._ensure_safetensors(model_path, subfolder)
