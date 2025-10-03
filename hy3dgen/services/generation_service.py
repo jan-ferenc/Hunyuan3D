@@ -88,6 +88,14 @@ class GenerationService:
         self.device = device
         self.rembg = BackgroundRemover()
 
+        try:
+            torch.set_float32_matmul_precision("high")
+            if torch.backends.cuda.is_available():
+                torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+        except Exception:  # pragma: no cover - defensive; these flags are best-effort
+            logger.debug('Torch backend optimisations could not be applied.', exc_info=True)
+
         sage_pref = os.environ.get('USE_SAGEATTN')
         if sage_pref != '0':
             if sage_pref is None:
