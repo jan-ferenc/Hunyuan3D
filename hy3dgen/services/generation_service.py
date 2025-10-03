@@ -51,7 +51,7 @@ class TextureGenerationSettings:
     delight_cache_size: int = 8
     seed: Optional[int] = 0
     adaptive_face_count: bool = True
-    adaptive_face_ratio: float = 0.1
+    adaptive_face_ratio: float = 0.05
     min_face_count: int = 10000
     max_face_count: int = 20000
 
@@ -282,6 +282,15 @@ class GenerationService:
         if candidate is not None:
             max_faces = min(max_faces, int(candidate))
         target = int(np.clip(base_target, min_faces, max_faces))
+        logger.debug(
+            'Adaptive face target: original=%s, surface=%.2f, bbox_area=%.2f, density=%.3f, base=%s, target=%s',
+            original_faces,
+            surface_area,
+            bbox_area,
+            density,
+            base_target,
+            target,
+        )
         return target
 
     def _maybe_compile_texture_models(self) -> None:
