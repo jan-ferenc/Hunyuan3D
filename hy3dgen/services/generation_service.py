@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 class ShapeGenerationSettings:
     num_inference_steps: int = 4
     guidance_scale: float = 3.0
-    box_v: float = 0.9
+    box_v: float = 1.01
     octree_resolution: int = 192
     num_chunks: int = 10000
     mc_algo: Optional[str] = None
