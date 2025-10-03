@@ -69,25 +69,11 @@ def mesh_uv_wrap(mesh):
             mesh.metadata = metadata
             return mesh
 
-    kwargs = {}
-    chart_options_ctor = getattr(xatlas, 'ChartOptions', None)
-    if callable(chart_options_ctor):
-        try:
-            chart_options = chart_options_ctor()
-            for attr, value in (
-                ('use_spatial_hash', True),
-                ('max_iterations', 1),
-                ('max_chart_area', 0.0),
-            ):
-                if hasattr(chart_options, attr):
-                    setattr(chart_options, attr, value)
-            kwargs['chart_options'] = chart_options
-        except Exception:
-            kwargs = {}
+    positions = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.uint32)
+    vmapping, indices, uvs = xatlas.parametrize(positions, faces)
 
-    vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces, **kwargs)
-
-    mesh.vertices = mesh.vertices[vmapping]
+    mesh.vertices = positions[vmapping]
     mesh.faces = indices
     mesh.visual.uv = uvs
 
