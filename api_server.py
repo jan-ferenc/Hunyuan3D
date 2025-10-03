@@ -251,7 +251,7 @@ async def stream_generation(
                     partial(
                         generation_service.standardize_mesh,
                         mesh,
-                        face_count=texture_settings.face_count,
+                        texture_settings=texture_settings,
                     ),
                 )
                 mesh_path = await loop.run_in_executor(

@@ -13,6 +13,7 @@ from typing import Optional
 import torch
 import trimesh
 from PIL import Image
+import numpy as np
 
 from hy3dgen.rembg import BackgroundRemover
 from hy3dgen.services.imagen_client import ImagePayload
@@ -49,17 +50,30 @@ class TextureGenerationSettings:
     reuse_delighting: bool = False
     delight_cache_size: int = 8
     seed: Optional[int] = 0
+    adaptive_face_count: bool = True
+    adaptive_face_ratio: float = 0.1
+    min_face_count: int = 10000
+    max_face_count: int = 20000
 
     def __post_init__(self) -> None:
         self.delight_steps = max(1, int(self.delight_steps))
         self.multiview_steps = max(1, int(self.multiview_steps))
         self.delight_cache_size = max(0, int(self.delight_cache_size))
+        self.adaptive_face_ratio = float(self.adaptive_face_ratio) if self.adaptive_face_ratio else 0.1
+        self.min_face_count = max(1, int(self.min_face_count))
+        self.max_face_count = max(self.min_face_count, int(self.max_face_count))
         if isinstance(self.reuse_delighting, str):
             self.reuse_delighting = self.reuse_delighting.lower() in {"1", "true", "yes", "on"}
         if self.seed is not None and self.seed != "":
             self.seed = int(self.seed)
         else:
             self.seed = None
+        if self.face_count is not None:
+            self.face_count = int(self.face_count)
+            if self.face_count < self.min_face_count:
+                self.face_count = self.min_face_count
+            if self.face_count > self.max_face_count:
+                self.face_count = self.max_face_count
 class GenerationService:
     """Wraps pipelines while reusing decoded imagery."""
 
@@ -136,12 +150,14 @@ class GenerationService:
 
         self.texture_enabled = enable_texture and tex_model_path is not None
         self.texture_pipeline: Optional[Hunyuan3DPaintPipeline] = None
+        self._texture_compiled = False
         if self.texture_enabled:
             try:
                 self.texture_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
                     tex_model_path,
                     subfolder=tex_model_subfolder,
                 )
+                self._maybe_compile_texture_models()
             except Exception as exc:
                 logger.warning(
                     "Texture pipeline unavailable (%s); continuing with texture generation disabled.",
@@ -180,13 +196,24 @@ class GenerationService:
         self,
         mesh: trimesh.Trimesh,
         *,
+        texture_settings: Optional[TextureGenerationSettings] = None,
         face_count: Optional[int] = None,
     ) -> trimesh.Trimesh:
-        face_target = face_count or TextureGenerationSettings().face_count
+        if texture_settings is None:
+            texture_settings = TextureGenerationSettings()
+        original_faces = len(mesh.faces)
+        metadata = getattr(mesh, 'metadata', {}) or {}
+        hunyuan_meta = metadata.setdefault('hunyuan3d', {})
+        hunyuan_meta.setdefault('original_face_count', original_faces)
+
+        adaptive_target = self._select_face_target(mesh, texture_settings, fallback=face_count)
+        face_target = adaptive_target
         mesh = self.float_remover(mesh)
         mesh = self.degenerate_face_remover(mesh)
         if face_target:
             mesh = self.face_reducer(mesh, max_facenum=face_target)
+        hunyuan_meta['face_reduced_to'] = face_target
+        mesh.metadata = metadata
         return self._tag_mesh_metadata(mesh, face_target=face_target)
 
     def generate_textured_mesh(
@@ -210,7 +237,7 @@ class GenerationService:
             mesh = self._tag_mesh_metadata(mesh)
             logger.debug('Texture preprocessing sanitized mesh in %.3fs', time.perf_counter() - stage_start)
 
-        face_target = settings.face_count
+        face_target = self._select_face_target(mesh, settings, fallback=settings.face_count)
         if face_target and (previously_reduced is None or previously_reduced > face_target):
             mesh = self.face_reducer(mesh, max_facenum=face_target)
             mesh = self._tag_mesh_metadata(mesh, face_target=face_target)
@@ -231,6 +258,55 @@ class GenerationService:
         )
         logger.debug('Texture pipeline completed in %.3fs', time.perf_counter() - stage_start)
         return textured_mesh
+
+    def _select_face_target(
+        self,
+        mesh: trimesh.Trimesh,
+        settings: TextureGenerationSettings,
+        *,
+        fallback: Optional[int] = None,
+    ) -> Optional[int]:
+        candidate = fallback or settings.face_count
+        if not settings.adaptive_face_count:
+            return candidate
+        original_faces = max(1, len(mesh.faces))
+        extent = mesh.bounds[1] - mesh.bounds[0] if hasattr(mesh, 'bounds') else np.ones(3)
+        bbox_area = float(2.0 * (extent[0] * extent[1] + extent[1] * extent[2] + extent[0] * extent[2]))
+        bbox_area = max(bbox_area, 1e-6)
+        surface_area = float(getattr(mesh, 'area', bbox_area)) or bbox_area
+        density = surface_area / bbox_area
+        density = float(np.clip(density, 0.4, 2.0))
+        base_target = int(original_faces * settings.adaptive_face_ratio * density)
+        min_faces = settings.min_face_count
+        max_faces = settings.max_face_count
+        if candidate is not None:
+            max_faces = min(max_faces, int(candidate))
+        target = int(np.clip(base_target, min_faces, max_faces))
+        return target
+
+    def _maybe_compile_texture_models(self) -> None:
+        if self._texture_compiled or not hasattr(torch, "compile") or not self.texture_pipeline:
+            return
+        compiled = []
+        try:
+            delight = self.texture_pipeline.models.get('delight_model') if hasattr(self.texture_pipeline, 'models') else None
+            pipe = getattr(delight, 'pipeline', None)
+            if pipe is not None and hasattr(pipe, 'unet'):
+                pipe.unet = torch.compile(pipe.unet, mode='reduce-overhead')
+                compiled.append('delight_unet')
+        except Exception:
+            logger.debug('torch.compile failed for delight_model', exc_info=True)
+        try:
+            multiview = self.texture_pipeline.models.get('multiview_model') if hasattr(self.texture_pipeline, 'models') else None
+            pipe = getattr(multiview, 'pipeline', None)
+            if pipe is not None and hasattr(pipe, 'unet'):
+                pipe.unet = torch.compile(pipe.unet, mode='reduce-overhead')
+                compiled.append('multiview_unet')
+        except Exception:
+            logger.debug('torch.compile failed for multiview_model', exc_info=True)
+        if compiled:
+            self._texture_compiled = True
+            logger.info('Enabled torch.compile for texture modules: %s', ', '.join(compiled))
 
     def export_mesh(
         self,
