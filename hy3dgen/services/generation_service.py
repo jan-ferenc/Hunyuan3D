@@ -43,7 +43,7 @@ class ShapeGenerationSettings:
 @dataclass
 class TextureGenerationSettings:
     enabled: bool = True
-    face_count: int = 40000
+    face_count: int = 20000
     delight_steps: int = 20
     multiview_steps: int = 12
     reuse_delighting: bool = False

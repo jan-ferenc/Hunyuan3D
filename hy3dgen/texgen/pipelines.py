@@ -271,9 +271,13 @@ class Hunyuan3DPaintPipeline:
             delighted_images.append(delighted)
         images_prompt = delighted_images
 
+        uv_start = time.perf_counter()
         mesh = mesh_uv_wrap(mesh)
+        logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', time.perf_counter() - uv_start, len(mesh.faces))
 
+        load_start = time.perf_counter()
         self.render.load_mesh(mesh)
+        logger.debug('Texture load_mesh completed in %.3fs', time.perf_counter() - load_start)
 
         selected_camera_elevs, selected_camera_azims, selected_view_weights = \
             self.config.candidate_camera_elevs, self.config.candidate_camera_azims, self.config.candidate_view_weights
@@ -309,9 +313,13 @@ class Hunyuan3DPaintPipeline:
 
         mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
 
+        inpaint_start = time.perf_counter()
         texture = self.texture_inpaint(texture, mask_np)
+        logger.debug('Texture inpaint completed in %.3fs', time.perf_counter() - inpaint_start)
 
         self.render.set_texture(texture)
+        save_start = time.perf_counter()
         textured_mesh = self.render.save_mesh()
+        logger.debug('Texture save_mesh completed in %.3fs', time.perf_counter() - save_start)
 
         return textured_mesh
