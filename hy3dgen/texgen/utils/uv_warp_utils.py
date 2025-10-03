@@ -14,6 +14,7 @@
 
 import hashlib
 import os
+import threading
 from collections import OrderedDict
 
 import numpy as np
@@ -22,6 +23,36 @@ import xatlas
 
 UV_CACHE: "OrderedDict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
 UV_CACHE_SIZE = int(os.environ.get('HY3DGEN_UV_CACHE_SIZE', 8))
+
+
+class _AtlasWrapper:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._atlas = xatlas.Atlas()
+        chart_opts = getattr(xatlas, 'ChartOptions', None)
+        if callable(chart_opts):
+            opts = chart_opts()
+            if hasattr(opts, 'use_spatial_hash'):
+                opts.use_spatial_hash = True
+            if hasattr(opts, 'max_iterations'):
+                opts.max_iterations = 1
+            self._chart_options = opts
+        else:
+            self._chart_options = None
+
+    def parametrize(self, vertices: np.ndarray, faces: np.ndarray):
+        with self._lock:
+            self._atlas.clear()
+            self._atlas.add_mesh(vertices, faces)
+            if self._chart_options is not None:
+                self._atlas.generate(chart_options=self._chart_options)
+            else:
+                self._atlas.generate()
+            charts = self._atlas.get_parameterization()
+            return charts.vertex_remap.copy(), charts.indices.copy(), charts.uvs.copy()
+
+
+_ATLAS = _AtlasWrapper()
 
 
 def _hash_mesh(mesh: trimesh.Trimesh) -> str:
@@ -71,7 +102,7 @@ def mesh_uv_wrap(mesh):
 
     positions = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.uint32)
-    vmapping, indices, uvs = xatlas.parametrize(positions, faces)
+    vmapping, indices, uvs = _ATLAS.parametrize(positions, faces)
 
     mesh.vertices = positions[vmapping]
     mesh.faces = indices
