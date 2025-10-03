@@ -261,8 +261,13 @@ class GenerationService:
         else:
             face_target = self._select_face_target(mesh, settings, fallback=settings.face_count)
 
-        if face_target and len(mesh.faces) > face_target:
-            mesh = self.face_reducer(mesh, max_facenum=face_target)
+        if face_target:
+            if len(mesh.faces) > face_target:
+                mesh = self.face_reducer(mesh, max_facenum=face_target)
+            elif len(mesh.faces) < face_target:
+                logger.debug('Texture stage retaining mesh with %s faces below target %s', len(mesh.faces), face_target)
+            else:
+                logger.debug('Texture stage preserving exact face count: %s', face_target)
 
         mesh = self._tag_mesh_metadata(mesh, face_target=face_target)
         if self.texture_pipeline is None:
