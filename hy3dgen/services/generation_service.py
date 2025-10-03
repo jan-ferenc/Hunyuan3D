@@ -251,12 +251,20 @@ class GenerationService:
             mesh = self._tag_mesh_metadata(mesh)
             logger.debug('Texture preprocessing sanitized mesh in %.3fs', time.perf_counter() - stage_start)
 
-        face_target = self._select_face_target(mesh, settings, fallback=settings.face_count)
-        if face_target and (previously_reduced is None or previously_reduced > face_target):
-            mesh = self.face_reducer(mesh, max_facenum=face_target)
-            mesh = self._tag_mesh_metadata(mesh, face_target=face_target)
+        if previously_reduced is not None:
+            try:
+                face_target = int(previously_reduced)
+            except (TypeError, ValueError):
+                face_target = None
+            else:
+                logger.debug('Texture stage reusing face target from mesh stage: %s', face_target)
         else:
-            mesh = self._tag_mesh_metadata(mesh, face_target=previously_reduced)
+            face_target = self._select_face_target(mesh, settings, fallback=settings.face_count)
+
+        if face_target and len(mesh.faces) > face_target:
+            mesh = self.face_reducer(mesh, max_facenum=face_target)
+
+        mesh = self._tag_mesh_metadata(mesh, face_target=face_target)
         if self.texture_pipeline is None:
             raise RuntimeError("Texture pipeline is not initialized")
         runtime_seed = settings.seed if settings.seed is not None else None
@@ -283,7 +291,19 @@ class GenerationService:
         candidate = fallback or settings.face_count
         if not settings.adaptive_face_count:
             return candidate
-        original_faces = max(1, len(mesh.faces))
+        current_faces = max(1, len(mesh.faces))
+        metadata = getattr(mesh, 'metadata', None)
+        stored_original = None
+        if isinstance(metadata, dict):
+            hunyuan_meta = metadata.get('hunyuan3d')
+            if isinstance(hunyuan_meta, dict):
+                stored_original = hunyuan_meta.get('original_face_count')
+                if stored_original is not None:
+                    try:
+                        stored_original = int(stored_original)
+                    except (TypeError, ValueError):
+                        stored_original = None
+        original_faces = stored_original if stored_original and stored_original > 0 else current_faces
         extent = mesh.bounds[1] - mesh.bounds[0] if hasattr(mesh, 'bounds') else np.ones(3)
         bbox_area = float(2.0 * (extent[0] * extent[1] + extent[1] * extent[2] + extent[0] * extent[2]))
         bbox_area = max(bbox_area, 1e-6)
@@ -307,8 +327,9 @@ class GenerationService:
         ):
             target = candidate_faces
         logger.debug(
-            'Adaptive face target: original=%s, surface=%.2f, bbox_area=%.2f, density=%.3f, base=%s, target=%s',
+            'Adaptive face target: original=%s, current=%s, surface=%.2f, bbox_area=%.2f, density=%.3f, base=%s, target=%s',
             original_faces,
+            current_faces,
             surface_area,
             bbox_area,
             density,
