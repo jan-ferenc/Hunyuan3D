@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import concurrent.futures
 import os
 import re
 import time
@@ -165,6 +166,8 @@ class GenerationService:
                 )
                 self.texture_enabled = False
 
+        self._warmup_pipelines()
+
     def prepare_image(self, payload: ImagePayload) -> Image.Image:
         image = payload.as_pil_rgba()
         image = self.rembg(image)
@@ -318,6 +321,72 @@ class GenerationService:
         if compiled:
             self._texture_compiled = True
             logger.info('Enabled torch.compile for texture modules: %s', ', '.join(compiled))
+
+    def _warmup_pipelines(self) -> None:
+        start_time = time.perf_counter()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                futures = []
+                futures.append(executor.submit(self._warmup_shape))
+                if self.texture_enabled and self.texture_pipeline is not None:
+                    futures.append(executor.submit(self._warmup_texture))
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception:  # pragma: no cover - warmup best effort
+                        logger.debug('Warmup task failed.', exc_info=True)
+        except Exception:  # pragma: no cover
+            logger.debug('Pipeline warmup failed.', exc_info=True)
+        else:
+            logger.info('Pipeline warmup completed in %.2fs', time.perf_counter() - start_time)
+
+    def _warmup_shape(self) -> None:
+        if self.shape_pipeline is None:
+            return
+        try:
+            dummy = Image.new('RGB', (512, 512), (128, 128, 128))
+            self.shape_pipeline(
+                image=dummy,
+                num_inference_steps=1,
+                guidance_scale=0.0,
+                box_v=0.5,
+                octree_resolution=64,
+                num_chunks=512,
+                enable_pbar=False,
+                output_type='trimesh',
+            )
+        except Exception:
+            logger.debug('Shape pipeline warmup failed.', exc_info=True)
+
+    def _warmup_texture(self) -> None:
+        if self.texture_pipeline is None:
+            return
+        try:
+            mesh = trimesh.creation.icosphere(subdivisions=1, radius=0.5)
+            mesh.metadata = {}
+            dummy_image = Image.new('RGBA', (512, 512), (255, 255, 255, 255))
+            warm_settings = TextureGenerationSettings(
+                enabled=True,
+                face_count=8000,
+                delight_steps=1,
+                multiview_steps=1,
+                reuse_delighting=False,
+                delight_cache_size=0,
+                seed=0,
+                adaptive_face_count=False,
+            )
+            mesh = self.standardize_mesh(mesh, texture_settings=warm_settings)
+            self.texture_pipeline(
+                mesh,
+                dummy_image,
+                delight_steps=warm_settings.delight_steps,
+                multiview_steps=warm_settings.multiview_steps,
+                reuse_delighting=warm_settings.reuse_delighting,
+                delight_cache_size=warm_settings.delight_cache_size,
+                seed=warm_settings.seed,
+            )
+        except Exception:
+            logger.debug('Texture pipeline warmup failed.', exc_info=True)
 
     def export_mesh(
         self,
