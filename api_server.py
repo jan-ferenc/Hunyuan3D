@@ -45,7 +45,7 @@ LOGDIR = '.'
 handler = None
 
 
-def build_logger(logger_name, logger_filename):
+def build_logger(logger_name, logger_filename, level: str = "INFO"):
     global handler
 
     formatter = logging.Formatter(
@@ -67,8 +67,10 @@ def build_logger(logger_name, logger_filename):
     sl = StreamToLogger(stderr_logger, logging.ERROR)
     sys.stderr = sl
 
+    resolved_level = getattr(logging, level.upper(), logging.INFO)
+
     logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(resolved_level)
 
     if handler is None:
         os.makedirs(LOGDIR, exist_ok=True)
@@ -80,6 +82,7 @@ def build_logger(logger_name, logger_filename):
         for name, item in logging.root.manager.loggerDict.items():
             if isinstance(item, logging.Logger):
                 item.addHandler(handler)
+                item.setLevel(resolved_level)
 
     return logger
 
@@ -114,7 +117,13 @@ class StreamToLogger(object):
 SAVE_DIR = 'gradio_cache'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-logger = build_logger("controller", f"{SAVE_DIR}/controller.log")
+_api_log_level = os.environ.get("API_LOG_LEVEL", "INFO")
+logger = build_logger("controller", f"{SAVE_DIR}/controller.log", level=_api_log_level)
+
+if _api_log_level.upper() == "DEBUG":
+    logging.getLogger("hy3dgen").setLevel(logging.DEBUG)
+    logging.getLogger("hy3dgen.texgen").setLevel(logging.DEBUG)
+    logging.getLogger("hy3dgen.services").setLevel(logging.DEBUG)
 
 model_semaphore: Optional[asyncio.Semaphore] = None
 generation_service: Optional[GenerationService] = None

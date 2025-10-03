@@ -35,7 +35,7 @@ class ShapeGenerationSettings:
     guidance_scale: float = 3.0
     box_v: float = 0.9
     octree_resolution: int = 192
-    num_chunks: int = 20000
+    num_chunks: int = 10000
     mc_algo: Optional[str] = None
     seed: Optional[int] = None
 
@@ -88,6 +88,16 @@ class GenerationService:
         self.device = device
         self.rembg = BackgroundRemover()
 
+        sage_pref = os.environ.get('USE_SAGEATTN')
+        if sage_pref != '0':
+            if sage_pref is None:
+                os.environ['USE_SAGEATTN'] = '1'
+            try:  # pragmatically enable SageAttention if the package is available
+                import sageattention  # type: ignore # noqa: F401
+            except ImportError:
+                logger.warning('Sage attention requested but package "sageattention" is not installed; disabling USE_SAGEATTN.')
+                os.environ['USE_SAGEATTN'] = '0'
+
         default_output = Path.cwd() / 'generated_meshes'
         configured_output = Path(output_dir) if output_dir else Path(
             os.environ.get('HY3DGEN_OUTPUT_DIR', default_output)
@@ -99,8 +109,13 @@ class GenerationService:
             model_path,
             device=device,
             enable_flashvdm=True,
+            use_safetensors=False,
             subfolder=shape_model_subfolder,
         )
+        try:
+            self.shape_pipeline.enable_flashvdm(topk_mode='merge')
+        except Exception:  # pragma: no cover - fallback to defaults if enhanced mode unavailable
+            logger.debug('Failed to set flashVDM topk_mode="merge"; continuing with pipeline defaults.', exc_info=True)
         # Configure default surface extractor once to avoid repeated deprecation warnings during inference.
         try:
             self.shape_pipeline.vae.surface_extractor = SurfaceExtractors['mc']()
