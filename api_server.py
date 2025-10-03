@@ -26,12 +26,15 @@ import os
 import sys
 import uuid
 import time
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
 from hy3dgen.services.generation_service import (
     GenerationService,
@@ -129,6 +132,8 @@ model_semaphore: Optional[asyncio.Semaphore] = None
 generation_service: Optional[GenerationService] = None
 imagen_client: Optional[GoogleImagenClient] = None
 
+VIEWER_HTML_PATH = Path(__file__).resolve().parent / "assets" / "viewer.html"
+
 
 def _merge_dicts(*dicts: Dict[str, Any]) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
@@ -137,6 +142,31 @@ def _merge_dicts(*dicts: Dict[str, Any]) -> Dict[str, Any]:
             if value is not None:
                 merged[key] = value
     return merged
+
+
+def _load_viewer_html() -> str:
+    if VIEWER_HTML_PATH.is_file():
+        try:
+            return VIEWER_HTML_PATH.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Failed to read viewer HTML: %s", exc)
+    return "<html><body><p>Viewer UI not found. Ensure assets/viewer.html exists.</p></body></html>"
+
+
+def _build_mesh_payload(mesh_path: str) -> Dict[str, str]:
+    payload: Dict[str, str] = {"mesh_path": mesh_path}
+    if generation_service is None:
+        return payload
+    try:
+        relative_path = Path(mesh_path).resolve().relative_to(generation_service.output_root)
+    except Exception:
+        relative_path = Path(mesh_path).name
+    relative_str = str(relative_path)
+    if relative_str.startswith(".."):
+        relative_str = Path(mesh_path).name
+    payload["mesh_relative_path"] = relative_str
+    payload["mesh_url"] = "/generated/" + relative_str.replace("\\", "/")
+    return payload
 
 
 def parse_shape_settings(payload: Dict[str, Any]) -> ShapeGenerationSettings:
@@ -217,6 +247,16 @@ app.add_middleware(
 )
 
 
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTMLResponse(_load_viewer_html())
+
+
+@app.get("/viewer", response_class=HTMLResponse)
+async def viewer():
+    return HTMLResponse(_load_viewer_html())
+
+
 async def stream_generation(
     job_id: str,
     user_query: str,
@@ -238,6 +278,30 @@ async def stream_generation(
 
                 image_payload = await loop.run_in_executor(None, imagen_client.generate, user_query)
                 image_ready = time.perf_counter()
+
+                image_seconds = image_ready - run_start
+                try:
+                    pil_image = image_payload.as_pil()
+                    fmt = (pil_image.format or "PNG") if pil_image is not None else "PNG"
+                    mime_type = Image.MIME.get(fmt.upper(), "image/png")
+                except Exception:
+                    mime_type = "image/png"
+
+                image_event: Dict[str, Any] = {
+                    "event": "image",
+                    "id": run_id,
+                    "image_base64": image_payload.as_base64(),
+                    "mime_type": mime_type,
+                    "timings": {
+                        "image_seconds": image_seconds,
+                    },
+                }
+                if benchmark_runs > 1:
+                    image_event["run"] = run_idx + 1
+                    image_event["runs_total"] = benchmark_runs
+                    image_event["parent_job"] = job_id
+                yield json.dumps(image_event) + "\n"
+
                 conditioning_image = await loop.run_in_executor(None, generation_service.prepare_image, image_payload)
 
                 mesh = await loop.run_in_executor(
@@ -262,15 +326,16 @@ async def stream_generation(
 
                 run_timing: Dict[str, Any] = {
                     "run": run_idx + 1,
-                    "image_seconds": image_ready - run_start,
+                    "image_seconds": image_seconds,
                     "mesh_seconds": mesh_ready - run_start,
                     "textured_seconds": None,
                 }
 
+                mesh_payload = _build_mesh_payload(mesh_path)
                 mesh_event = {
                     "event": "mesh",
                     "id": run_id,
-                    "mesh_path": mesh_path,
+                    **mesh_payload,
                     "timings": {
                         "image_seconds": run_timing["image_seconds"],
                         "mesh_seconds": run_timing["mesh_seconds"],
@@ -303,10 +368,11 @@ async def stream_generation(
                         textured_ready = time.perf_counter()
                         run_timing["textured_seconds"] = textured_ready - run_start
 
+                        textured_payload = _build_mesh_payload(textured_path)
                         textured_event = {
                             "event": "textured_mesh",
                             "id": run_id,
-                            "mesh_path": textured_path,
+                            **textured_payload,
                             "timings": {
                                 "image_seconds": run_timing["image_seconds"],
                                 "mesh_seconds": run_timing["mesh_seconds"],
@@ -426,5 +492,14 @@ if __name__ == "__main__":
         device=args.device,
         enable_texture=not args.disable_texture,
     )
+
+    try:
+        app.mount(
+            "/generated",
+            StaticFiles(directory=str(generation_service.output_root)),
+            name="generated",
+        )
+    except Exception as exc:
+        logger.warning("Unable to mount generated assets directory: %s", exc)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

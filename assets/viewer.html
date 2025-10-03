@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hunyuan3D Live Viewer</title>
+  <script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", sans-serif;
+      background: #0f1219;
+      color: #e7ecff;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    main {
+      margin: 0 auto;
+      max-width: 1320px;
+      width: 100%;
+      padding: 24px;
+      box-sizing: border-box;
+      display: grid;
+      gap: 24px;
+      grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+    }
+    @media (max-width: 1100px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+    }
+    h1 {
+      font-size: 1.6rem;
+      margin-top: 0;
+    }
+    .card {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: 0 18px 45px rgba(2, 6, 23, 0.45);
+      backdrop-filter: blur(9px);
+    }
+    form {
+      display: grid;
+      gap: 16px;
+    }
+    label {
+      font-size: 0.9rem;
+      color: #9da7c4;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+      padding: 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      background: rgba(10, 12, 20, 0.8);
+      color: inherit;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #5ad1ff;
+      box-shadow: 0 0 0 2px rgba(90, 209, 255, 0.2);
+    }
+    .toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    button {
+      padding: 12px 18px;
+      border-radius: 999px;
+      border: none;
+      font-size: 1rem;
+      font-weight: 600;
+      background: linear-gradient(135deg, #3fa3ff, #6c63ff);
+      color: #fff;
+      cursor: pointer;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 24px rgba(63, 163, 255, 0.3);
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: wait;
+      box-shadow: none;
+    }
+    .status {
+      margin-top: 6px;
+      font-size: 0.85rem;
+      color: #a7b5d7;
+      white-space: pre-line;
+    }
+    .panels {
+      display: grid;
+      gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    img, model-viewer {
+      width: 100%;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      min-height: 280px;
+      object-fit: contain;
+    }
+    model-viewer::-webkit-media-controls-panel {
+      display: none !important;
+      -webkit-appearance: none;
+    }
+    .downloads {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 0.85rem;
+      margin-top: 12px;
+    }
+    .downloads a {
+      color: #5ad1ff;
+      text-decoration: none;
+    }
+    .downloads a:hover {
+      text-decoration: underline;
+    }
+    .log {
+      font-family: "JetBrains Mono", "SFMono-Regular", monospace;
+      font-size: 0.8rem;
+      background: rgba(0, 0, 0, 0.35);
+      border-radius: 10px;
+      padding: 12px;
+      max-height: 220px;
+      overflow: auto;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>Hunyuan3D Live Viewer</h1>
+      <p>Enter a text prompt, then watch the Google Imagen preview, the intermediate mesh, and the final textured mesh stream in as the pipelines finish.</p>
+      <form id="promptForm">
+        <label>
+          Prompt
+          <textarea id="promptInput" placeholder="e.g. A glossy ceramic teapot shaped like a fox" required></textarea>
+        </label>
+        <div class="toggle">
+          <span>Generate textured mesh</span>
+          <label style="flex-direction: row; align-items: center; gap: 8px;">
+            <input id="textureToggle" type="checkbox" checked />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <button id="submitButton" type="submit">Generate</button>
+        <div class="status" id="status"></div>
+      </form>
+      <div class="downloads">
+        <a id="meshDownload" href="#" download hidden>Download mesh</a>
+        <a id="texturedDownload" href="#" download hidden>Download textured mesh</a>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
+    <section class="panels">
+      <div class="card panel">
+        <h2>Google Imagen Preview</h2>
+        <img id="previewImage" alt="Imagen preview will appear here" />
+      </div>
+      <div class="card panel">
+        <h2>Intermediate Mesh</h2>
+        <model-viewer id="meshViewer" camera-controls shadow-intensity="1" exposure="1.1"></model-viewer>
+      </div>
+      <div class="card panel">
+        <h2>Textured Mesh</h2>
+        <model-viewer id="texturedViewer" camera-controls shadow-intensity="1" exposure="1.1"></model-viewer>
+      </div>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById('promptForm');
+    const promptInput = document.getElementById('promptInput');
+    const textureToggle = document.getElementById('textureToggle');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const submitButton = document.getElementById('submitButton');
+    const previewImg = document.getElementById('previewImage');
+    const meshViewer = document.getElementById('meshViewer');
+    const texturedViewer = document.getElementById('texturedViewer');
+    const meshDownload = document.getElementById('meshDownload');
+    const texturedDownload = document.getElementById('texturedDownload');
+
+    let activeController = null;
+
+    function resetViewers() {
+      previewImg.removeAttribute('src');
+      meshViewer.removeAttribute('src');
+      texturedViewer.removeAttribute('src');
+      meshViewer.removeAttribute('poster');
+      texturedViewer.removeAttribute('poster');
+      meshDownload.hidden = true;
+      texturedDownload.hidden = true;
+      meshDownload.removeAttribute('href');
+      texturedDownload.removeAttribute('href');
+      logEl.textContent = '';
+      updateStatus('');
+    }
+
+    function updateStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function appendLog(line) {
+      const timestamp = new Date().toLocaleTimeString();
+      logEl.textContent += `[${timestamp}] ${line}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function streamResponse(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf('\n');
+        while (boundary !== -1) {
+          const chunk = buffer.slice(0, boundary).trim();
+          buffer = buffer.slice(boundary + 1);
+          if (chunk) {
+            try {
+              const event = JSON.parse(chunk);
+              handleEvent(event);
+            } catch (err) {
+              console.error('Failed to parse chunk', chunk, err);
+              appendLog(`Failed to parse server chunk: ${err}`);
+            }
+          }
+          boundary = buffer.indexOf('\n');
+        }
+      }
+    }
+
+    function handleEvent(event) {
+      appendLog(`Event: ${event.event}`);
+      switch (event.event) {
+        case 'image': {
+          const mime = event.mime_type || 'image/png';
+          previewImg.src = `data:${mime};base64,${event.image_base64}`;
+          updateStatus('Imagen preview received. Mesh generation in progress...');
+          break;
+        }
+        case 'mesh': {
+          if (event.mesh_url) {
+            meshViewer.src = event.mesh_url;
+            meshDownload.href = event.mesh_url;
+            meshDownload.hidden = false;
+          }
+          if (previewImg.src) {
+            meshViewer.poster = previewImg.src;
+          }
+          updateStatus('Mesh ready. Texturing (if enabled) running...');
+          break;
+        }
+        case 'textured_mesh': {
+          if (event.mesh_url) {
+            texturedViewer.src = event.mesh_url;
+            texturedDownload.href = event.mesh_url;
+            texturedDownload.hidden = false;
+          }
+          if (previewImg.src) {
+            texturedViewer.poster = previewImg.src;
+          }
+          updateStatus('Textured mesh finished.');
+          break;
+        }
+        case 'texture_skipped': {
+          updateStatus('Mesh complete. Texture generation was skipped.');
+          break;
+        }
+        case 'run_complete':
+        case 'complete': {
+          updateStatus('Job complete.');
+          break;
+        }
+        case 'error': {
+          updateStatus(`Error: ${event.message || 'Unknown error'}`);
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    async function submitPrompt(evt) {
+      evt.preventDefault();
+
+      const prompt = promptInput.value.trim();
+      if (!prompt) {
+        updateStatus('Please enter a prompt first.');
+        return;
+      }
+
+      if (activeController) {
+        activeController.abort();
+      }
+      activeController = new AbortController();
+
+      resetViewers();
+      updateStatus('Submitting prompt to server...');
+      submitButton.disabled = true;
+
+      try {
+        const payload = {
+          user_query: prompt,
+          texture: textureToggle.checked,
+        };
+
+        const response = await fetch('/generate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+          signal: activeController.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          const text = await response.text();
+          throw new Error(`Request failed: ${response.status} ${text}`);
+        }
+
+        appendLog('Streaming started...');
+        await streamResponse(response);
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          appendLog('Previous job aborted.');
+        } else {
+          console.error(error);
+          appendLog(`Error: ${error.message}`);
+          updateStatus(`Error: ${error.message}`);
+        }
+      } finally {
+        submitButton.disabled = false;
+        activeController = null;
+      }
+    }
+
+    form.addEventListener('submit', submitPrompt);
+  </script>
+</body>
+</html>
