@@ -119,10 +119,6 @@ class GenerationService:
                     tex_model_path,
                     subfolder=tex_model_subfolder,
                 )
-                try:
-                    self.texture_pipeline.enable_model_cpu_offload(device=device)
-                except Exception:  # pragma: no cover - permissive setup
-                    logger.warning('Texture pipeline CPU offload skipped (unsupported configuration).', exc_info=True)
             except Exception as exc:
                 logger.warning(
                     "Texture pipeline unavailable (%s); continuing with texture generation disabled.",

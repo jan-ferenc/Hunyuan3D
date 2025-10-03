@@ -19,6 +19,7 @@ import os
 import torch
 from PIL import Image
 from typing import List, Union, Optional
+import time
 
 try:
     import safetensors.torch
@@ -257,6 +258,7 @@ class Hunyuan3DPaintPipeline:
 
         delighted_images = []
         for image_prompt in images_prompt:
+            delight_start = time.perf_counter()
             delighted = self.models['delight_model'](
                 image_prompt,
                 num_inference_steps=delight_steps,
@@ -264,6 +266,8 @@ class Hunyuan3DPaintPipeline:
                 cache_size=delight_cache_size,
                 seed=seed,
             )
+            delight_elapsed = time.perf_counter() - delight_start
+            logger.debug('Texture delight stage completed in %.3fs (steps=%s)', delight_elapsed, delight_steps)
             delighted_images.append(delighted)
         images_prompt = delighted_images
 
@@ -282,6 +286,7 @@ class Hunyuan3DPaintPipeline:
         camera_info = [(((azim // 30) + 9) % 12) // {-20: 1, 0: 1, 20: 1, -90: 3, 90: 3}[
             elev] + {-20: 0, 0: 12, 20: 24, -90: 36, 90: 40}[elev] for azim, elev in
                        zip(selected_camera_azims, selected_camera_elevs)]
+        multiview_start = time.perf_counter()
         multiviews = self.models['multiview_model'](
             images_prompt,
             normal_maps + position_maps,
@@ -289,15 +294,18 @@ class Hunyuan3DPaintPipeline:
             num_inference_steps=multiview_steps,
             seed=seed,
         )
+        logger.debug('Texture multiview diffusion completed in %.3fs (steps=%s)', time.perf_counter() - multiview_start, multiview_steps)
 
         for i in range(len(multiviews)):
             # multiviews[i] = self.models['super_model'](multiviews[i])
             multiviews[i] = multiviews[i].resize(
                 (self.config.render_size, self.config.render_size))
 
+        bake_start = time.perf_counter()
         texture, mask = self.bake_from_multiview(multiviews,
                                                  selected_camera_elevs, selected_camera_azims, selected_view_weights,
                                                  method=self.config.merge_method)
+        logger.debug('Texture baking completed in %.3fs', time.perf_counter() - bake_start)
 
         mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
 
