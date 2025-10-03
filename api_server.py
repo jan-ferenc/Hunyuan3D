@@ -324,11 +324,13 @@ async def stream_generation(
                 )
                 mesh_ready = time.perf_counter()
 
+                mesh_stage_seconds = max(mesh_ready - image_ready, 0.0)
                 run_timing: Dict[str, Any] = {
                     "run": run_idx + 1,
                     "image_seconds": image_seconds,
-                    "mesh_seconds": mesh_ready - run_start,
+                    "mesh_seconds": mesh_stage_seconds,
                     "textured_seconds": None,
+                    "total_seconds": mesh_ready - run_start,
                 }
 
                 mesh_payload = _build_mesh_payload(mesh_path)
@@ -339,6 +341,7 @@ async def stream_generation(
                     "timings": {
                         "image_seconds": run_timing["image_seconds"],
                         "mesh_seconds": run_timing["mesh_seconds"],
+                        "total_seconds": run_timing["total_seconds"],
                     },
                 }
                 if benchmark_runs > 1:
@@ -366,7 +369,8 @@ async def stream_generation(
                             ),
                         )
                         textured_ready = time.perf_counter()
-                        run_timing["textured_seconds"] = textured_ready - run_start
+                        run_timing["textured_seconds"] = max(textured_ready - mesh_ready, 0.0)
+                        run_timing["total_seconds"] = textured_ready - run_start
 
                         textured_payload = _build_mesh_payload(textured_path)
                         textured_event = {
@@ -377,6 +381,7 @@ async def stream_generation(
                                 "image_seconds": run_timing["image_seconds"],
                                 "mesh_seconds": run_timing["mesh_seconds"],
                                 "textured_seconds": run_timing["textured_seconds"],
+                                "total_seconds": run_timing["total_seconds"],
                             },
                         }
                         if benchmark_runs > 1:
@@ -409,6 +414,7 @@ async def stream_generation(
                             "image_seconds": run_timing["image_seconds"],
                             "mesh_seconds": run_timing["mesh_seconds"],
                             "textured_seconds": run_timing["textured_seconds"],
+                            "total_seconds": run_timing["total_seconds"],
                         },
                     }) + "\n"
 
@@ -418,7 +424,7 @@ async def stream_generation(
             }
             if benchmark_runs > 1:
                 averages: Dict[str, float] = {}
-                for key in ("image_seconds", "mesh_seconds", "textured_seconds"):
+                for key in ("image_seconds", "mesh_seconds", "textured_seconds", "total_seconds"):
                     values = [t[key] for t in timing_records if t.get(key) is not None]
                     if values:
                         averages[key] = sum(values) / len(values)
