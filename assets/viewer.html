@@ -101,6 +101,11 @@
       color: #a7b5d7;
       white-space: pre-line;
     }
+    .timings {
+      margin-top: 4px;
+      font-size: 0.85rem;
+      color: #6fd5ff;
+    }
     .panels {
       display: grid;
       gap: 20px;
@@ -168,6 +173,7 @@
         </div>
         <button id="submitButton" type="submit">Generate</button>
         <div class="status" id="status"></div>
+        <div class="timings" id="timings"></div>
       </form>
       <div class="downloads">
         <a id="meshDownload" href="#" download hidden>Download mesh</a>
@@ -195,6 +201,7 @@
     const promptInput = document.getElementById('promptInput');
     const textureToggle = document.getElementById('textureToggle');
     const statusEl = document.getElementById('status');
+    const timingsEl = document.getElementById('timings');
     const logEl = document.getElementById('log');
     const submitButton = document.getElementById('submitButton');
     const previewImg = document.getElementById('previewImage');
@@ -217,6 +224,7 @@
       texturedDownload.removeAttribute('href');
       logEl.textContent = '';
       updateStatus('');
+      setTimings(null);
     }
 
     function updateStatus(message) {
@@ -227,6 +235,29 @@
       const timestamp = new Date().toLocaleTimeString();
       logEl.textContent += `[${timestamp}] ${line}\n`;
       logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatSeconds(value) {
+      if (value === null || value === undefined) return null;
+      if (!Number.isFinite(value)) return null;
+      return `${value.toFixed(2)}s`;
+    }
+
+    function setTimings(timings) {
+      if (!timings) {
+        timingsEl.textContent = '';
+        return;
+      }
+      const parts = [];
+      const image = formatSeconds(Number(timings.image_seconds));
+      const mesh = formatSeconds(Number(timings.mesh_seconds));
+      const textured = formatSeconds(Number(timings.textured_seconds));
+      const total = formatSeconds(Number(timings.total_seconds));
+      if (image) parts.push(`image ${image}`);
+      if (mesh) parts.push(`mesh ${mesh}`);
+      if (textured) parts.push(`texture ${textured}`);
+      if (total) parts.push(`total ${total}`);
+      timingsEl.textContent = parts.join(' · ');
     }
 
     async function streamResponse(response) {
@@ -260,11 +291,16 @@
 
     function handleEvent(event) {
       appendLog(`Event: ${event.event}`);
+      if (event.timings) {
+        setTimings(event.timings);
+      }
       switch (event.event) {
         case 'image': {
           const mime = event.mime_type || 'image/png';
           previewImg.src = `data:${mime};base64,${event.image_base64}`;
-          updateStatus('Imagen preview received. Mesh generation in progress...');
+          const timing = event.timings?.image_seconds;
+          const formatted = typeof timing === 'number' ? ` (${timing.toFixed(2)}s)` : '';
+          updateStatus(`Imagen preview received${formatted}. Mesh generation in progress...`);
           break;
         }
         case 'mesh': {
@@ -276,7 +312,9 @@
           if (previewImg.src) {
             meshViewer.poster = previewImg.src;
           }
-          updateStatus('Mesh ready. Texturing (if enabled) running...');
+          const total = event.timings?.total_seconds;
+          const formatted = typeof total === 'number' ? ` (${total.toFixed(2)}s total)` : '';
+          updateStatus(`Mesh ready${formatted}. Texturing (if enabled) running...`);
           break;
         }
         case 'textured_mesh': {
@@ -288,7 +326,9 @@
           if (previewImg.src) {
             texturedViewer.poster = previewImg.src;
           }
-          updateStatus('Textured mesh finished.');
+          const total = event.timings?.total_seconds;
+          const formatted = typeof total === 'number' ? ` (${total.toFixed(2)}s total)` : '';
+          updateStatus(`Textured mesh finished${formatted}.`);
           break;
         }
         case 'texture_skipped': {
@@ -297,7 +337,12 @@
         }
         case 'run_complete':
         case 'complete': {
-          updateStatus('Job complete.');
+          if (event.benchmark?.averages) {
+            setTimings(event.benchmark.averages);
+          }
+          const total = event.timings?.total_seconds || event.benchmark?.averages?.total_seconds;
+          const formatted = typeof total === 'number' ? ` (${total.toFixed(2)}s total)` : '';
+          updateStatus(`Job complete${formatted}.`);
           break;
         }
         case 'error': {

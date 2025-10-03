@@ -16,7 +16,7 @@ import copy
 import importlib
 import inspect
 import os
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -740,13 +740,16 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         batch_size = image.shape[0]
 
         # 5. Prepare timesteps
-        # NOTE: this is slightly different from common usage, we start from 0.
-        sigmas = np.linspace(0, 1, num_inference_steps) if sigmas is None else sigmas
+        timestep_kwargs: Dict[str, Any] = {}
+        if sigmas is not None:
+            timestep_kwargs["sigmas"] = np.asarray(sigmas, dtype=np.float32)
+        elif timesteps is not None:
+            timestep_kwargs["timesteps"] = timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
             device,
-            sigmas=sigmas,
+            **timestep_kwargs,
         )
         latents = self.prepare_latents(batch_size, dtype, device, generator)
 

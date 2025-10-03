@@ -8,6 +8,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +56,9 @@ class TextureGenerationSettings:
     adaptive_face_ratio: float = 0.05
     min_face_count: int = 10000
     max_face_count: int = 20000
+    high_detail_surface_area: float = 5.0
+    high_detail_density: float = 0.43
+    high_detail_original_ratio: float = 1.5
 
     def __post_init__(self) -> None:
         self.delight_steps = max(1, int(self.delight_steps))
@@ -63,6 +67,9 @@ class TextureGenerationSettings:
         self.adaptive_face_ratio = float(self.adaptive_face_ratio) if self.adaptive_face_ratio else 0.1
         self.min_face_count = max(1, int(self.min_face_count))
         self.max_face_count = max(self.min_face_count, int(self.max_face_count))
+        self.high_detail_surface_area = float(self.high_detail_surface_area)
+        self.high_detail_density = float(self.high_detail_density)
+        self.high_detail_original_ratio = max(1.0, float(self.high_detail_original_ratio))
         if isinstance(self.reuse_delighting, str):
             self.reuse_delighting = self.reuse_delighting.lower() in {"1", "true", "yes", "on"}
         if self.seed is not None and self.seed != "":
@@ -77,6 +84,10 @@ class TextureGenerationSettings:
                 self.face_count = self.max_face_count
 class GenerationService:
     """Wraps pipelines while reusing decoded imagery."""
+
+    @staticmethod
+    def sanitize_job_id(job_id: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z_.-]", "_", job_id) or "job"
 
     @staticmethod
     def _tag_mesh_metadata(mesh: trimesh.Trimesh, *, face_target: Optional[int] = None) -> trimesh.Trimesh:
@@ -285,6 +296,16 @@ class GenerationService:
         if candidate is not None:
             max_faces = min(max_faces, int(candidate))
         target = int(np.clip(base_target, min_faces, max_faces))
+        candidate_faces = int(candidate) if candidate is not None else None
+        if (
+            candidate_faces is not None
+            and target <= min_faces
+            and candidate_faces <= max_faces
+            and original_faces >= candidate_faces * settings.high_detail_original_ratio
+            and surface_area >= settings.high_detail_surface_area
+            and density >= settings.high_detail_density
+        ):
+            target = candidate_faces
         logger.debug(
             'Adaptive face target: original=%s, surface=%.2f, bbox_area=%.2f, density=%.3f, base=%s, target=%s',
             original_faces,
@@ -396,12 +417,7 @@ class GenerationService:
         textured: bool = False,
         file_type: str = 'glb',
     ) -> str:
-        sanitized = re.sub(r"[^0-9a-zA-Z_.-]", "_", job_id) or "job"
-        job_dir = self.output_root / sanitized
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        filename = 'textured_mesh' if textured else 'mesh'
-        path = job_dir / f"{filename}.{file_type}"
+        path = self.resolve_export_path(job_id, textured=textured, file_type=file_type)
 
         export_kwargs = {}
         if file_type.lower() in {'glb', 'gltf'}:
@@ -410,3 +426,24 @@ class GenerationService:
         mesh.export(str(path), file_type=file_type, **export_kwargs)
         logger.info('Saved %s mesh to %s', 'textured' if textured else 'generated', path)
         return str(path)
+
+    def resolve_export_path(self, job_id: str, *, textured: bool = False, file_type: str = 'glb') -> Path:
+        sanitized = self.sanitize_job_id(job_id)
+        job_dir = self.output_root / sanitized
+        job_dir.mkdir(parents=True, exist_ok=True)
+        filename = 'textured_mesh' if textured else 'mesh'
+        return job_dir / f"{filename}.{file_type}"
+
+    def mesh_to_glb_bytes(
+        self,
+        mesh: trimesh.Trimesh,
+        *,
+        textured: bool = False,
+        file_type: str = 'glb',
+    ) -> bytes:
+        buffer = BytesIO()
+        export_kwargs = {}
+        if file_type.lower() in {'glb', 'gltf'}:
+            export_kwargs['include_normals'] = True
+        mesh.export(buffer, file_type=file_type, **export_kwargs)
+        return buffer.getvalue()

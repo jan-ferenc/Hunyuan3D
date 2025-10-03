@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import OrderedDict
 from functools import partial
 import json
 import logging
@@ -27,12 +28,12 @@ import sys
 import uuid
 import time
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Awaitable, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
@@ -134,6 +135,11 @@ imagen_client: Optional[GoogleImagenClient] = None
 
 VIEWER_HTML_PATH = Path(__file__).resolve().parent / "assets" / "viewer.html"
 
+MESH_CACHE_LIMIT = int(os.environ.get("HY3DGEN_MESH_CACHE_LIMIT", "24"))
+mesh_cache: "OrderedDict[str, Dict[str, bytes]]" = OrderedDict()
+mesh_cache_lock = asyncio.Lock()
+_background_exports: "set[asyncio.Task]" = set()
+
 
 def _merge_dicts(*dicts: Dict[str, Any]) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
@@ -153,19 +159,65 @@ def _load_viewer_html() -> str:
     return "<html><body><p>Viewer UI not found. Ensure assets/viewer.html exists.</p></body></html>"
 
 
-def _build_mesh_payload(mesh_path: str) -> Dict[str, str]:
-    payload: Dict[str, str] = {"mesh_path": mesh_path}
+async def _cache_mesh_bytes(cache_key: str, variant: str, data: bytes) -> None:
+    async with mesh_cache_lock:
+        entry = mesh_cache.get(cache_key)
+        if entry is None:
+            entry = {}
+        entry[variant] = data
+        mesh_cache[cache_key] = entry
+        mesh_cache.move_to_end(cache_key)
+        while len(mesh_cache) > MESH_CACHE_LIMIT:
+            mesh_cache.popitem(last=False)
+
+
+async def _get_cached_mesh_bytes(cache_key: str, variant: str) -> Optional[bytes]:
+    async with mesh_cache_lock:
+        entry = mesh_cache.get(cache_key)
+        if entry is None:
+            return None
+        mesh_cache.move_to_end(cache_key)
+        return entry.get(variant)
+
+
+def _schedule_background_task(coro: Awaitable[None]) -> None:
+    task = asyncio.create_task(coro)
+    _background_exports.add(task)
+    task.add_done_callback(lambda finished: _background_exports.discard(finished))
+
+
+async def _export_mesh_background(mesh, run_id: str, *, textured: bool) -> None:
+    if generation_service is None:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            partial(
+                generation_service.export_mesh,
+                mesh,
+                run_id,
+                textured=textured,
+            ),
+        )
+    except Exception:  # pragma: no cover - best effort persistence
+        logger.exception(
+            "Background export failed for job %s (textured=%s)",
+            run_id,
+            textured,
+        )
+
+
+def _build_mesh_payload(*, mesh_path: Path, cache_key: str, variant: str) -> Dict[str, str]:
+    payload: Dict[str, str] = {"mesh_path": str(mesh_path)}
+    payload["mesh_url"] = f"/jobs/{cache_key}/{variant}.glb"
     if generation_service is None:
         return payload
     try:
-        relative_path = Path(mesh_path).resolve().relative_to(generation_service.output_root)
+        relative_path = mesh_path.resolve().relative_to(generation_service.output_root)
     except Exception:
-        relative_path = Path(mesh_path).name
-    relative_str = str(relative_path)
-    if relative_str.startswith(".."):
-        relative_str = Path(mesh_path).name
-    payload["mesh_relative_path"] = relative_str
-    payload["mesh_url"] = "/generated/" + relative_str.replace("\\", "/")
+        relative_path = mesh_path.name
+    payload["mesh_relative_path"] = str(relative_path)
     return payload
 
 
@@ -257,6 +309,28 @@ async def viewer():
     return HTMLResponse(_load_viewer_html())
 
 
+@app.get("/jobs/{cache_key}/{variant}.glb")
+async def serve_job_asset(cache_key: str, variant: str):
+    normalized_variant = "textured" if variant.lower().startswith("textured") else "mesh"
+    cached = await _get_cached_mesh_bytes(cache_key, normalized_variant)
+    if cached is not None:
+        return Response(content=cached, media_type="model/gltf-binary")
+
+    if generation_service is not None:
+        try:
+            path = generation_service.resolve_export_path(
+                cache_key,
+                textured=(normalized_variant == "textured"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning("Failed to resolve export path for %s: %s", cache_key, exc)
+        else:
+            if path.exists():
+                return FileResponse(path, media_type="model/gltf-binary")
+
+    raise HTTPException(status_code=404, detail="Mesh asset not found")
+
+
 async def stream_generation(
     job_id: str,
     user_query: str,
@@ -318,10 +392,17 @@ async def stream_generation(
                         texture_settings=texture_settings,
                     ),
                 )
-                mesh_path = await loop.run_in_executor(
+                cache_key = GenerationService.sanitize_job_id(run_id)
+                mesh_path = generation_service.resolve_export_path(run_id, textured=False)
+                mesh_bytes = await loop.run_in_executor(
                     None,
-                    partial(generation_service.export_mesh, mesh, run_id),
+                    partial(
+                        generation_service.mesh_to_glb_bytes,
+                        mesh,
+                        textured=False,
+                    ),
                 )
+                await _cache_mesh_bytes(cache_key, "mesh", mesh_bytes)
                 mesh_ready = time.perf_counter()
 
                 mesh_stage_seconds = max(mesh_ready - image_ready, 0.0)
@@ -333,7 +414,11 @@ async def stream_generation(
                     "total_seconds": mesh_ready - run_start,
                 }
 
-                mesh_payload = _build_mesh_payload(mesh_path)
+                mesh_payload = _build_mesh_payload(
+                    mesh_path=mesh_path,
+                    cache_key=cache_key,
+                    variant="mesh",
+                )
                 mesh_event = {
                     "event": "mesh",
                     "id": run_id,
@@ -350,6 +435,15 @@ async def stream_generation(
                     mesh_event["parent_job"] = job_id
                 yield json.dumps(mesh_event) + "\n"
 
+                mesh_copy_for_disk = mesh.copy()
+                _schedule_background_task(
+                    _export_mesh_background(
+                        mesh_copy_for_disk,
+                        run_id,
+                        textured=False,
+                    )
+                )
+
                 if texture_settings.enabled:
                     if generation_service.texture_enabled:
                         textured_mesh = await loop.run_in_executor(
@@ -359,20 +453,25 @@ async def stream_generation(
                             conditioning_image,
                             texture_settings,
                         )
-                        textured_path = await loop.run_in_executor(
+                        textured_path = generation_service.resolve_export_path(run_id, textured=True)
+                        textured_bytes = await loop.run_in_executor(
                             None,
                             partial(
-                                generation_service.export_mesh,
+                                generation_service.mesh_to_glb_bytes,
                                 textured_mesh,
-                                run_id,
                                 textured=True,
                             ),
                         )
+                        await _cache_mesh_bytes(cache_key, "textured", textured_bytes)
                         textured_ready = time.perf_counter()
                         run_timing["textured_seconds"] = max(textured_ready - mesh_ready, 0.0)
                         run_timing["total_seconds"] = textured_ready - run_start
 
-                        textured_payload = _build_mesh_payload(textured_path)
+                        textured_payload = _build_mesh_payload(
+                            mesh_path=textured_path,
+                            cache_key=cache_key,
+                            variant="textured",
+                        )
                         textured_event = {
                             "event": "textured_mesh",
                             "id": run_id,
@@ -389,6 +488,15 @@ async def stream_generation(
                             textured_event["runs_total"] = benchmark_runs
                             textured_event["parent_job"] = job_id
                         yield json.dumps(textured_event) + "\n"
+
+                        textured_copy_for_disk = textured_mesh.copy()
+                        _schedule_background_task(
+                            _export_mesh_background(
+                                textured_copy_for_disk,
+                                run_id,
+                                textured=True,
+                            )
+                        )
                     else:
                         skipped_event = {
                             "event": "texture_skipped",
@@ -422,6 +530,8 @@ async def stream_generation(
                 "event": "complete",
                 "id": job_id,
             }
+            if timing_records:
+                complete_event["timings"] = timing_records[-1]
             if benchmark_runs > 1:
                 averages: Dict[str, float] = {}
                 for key in ("image_seconds", "mesh_seconds", "textured_seconds", "total_seconds"):
