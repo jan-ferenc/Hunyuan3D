@@ -48,6 +48,30 @@ def _ensure_inductor_cudagraphs_disabled() -> None:
         _ensure_inductor_cudagraphs_disabled._applied = True  # type: ignore[attr-defined]
 
 
+def _should_compile_for_device(device: str) -> bool:
+    pref = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '').strip().lower()
+    if pref in {'0', 'false', 'no', 'off'}:
+        return False
+    if not hasattr(torch, 'compile'):
+        return False
+    if pref in {'1', 'true', 'yes', 'on'}:
+        return True
+    if not torch.cuda.is_available() or not device.startswith('cuda'):
+        return False
+    try:
+        idx = torch.cuda.current_device()
+        if device != 'cuda':
+            idx = int(device.split(':', 1)[1])
+        major, _ = torch.cuda.get_device_capability(idx)
+        return major >= 9
+    except (IndexError, ValueError):
+        logger.debug('Failed to parse CUDA device from %s; disabling torch.compile.', device)
+        return False
+    except Exception:
+        logger.debug('Unable to determine CUDA capability for torch.compile decision.', exc_info=True)
+        return False
+
+
 class Light_Shadow_Remover():
     def __init__(self, config):
         self.device = config.device
@@ -74,8 +98,7 @@ class Light_Shadow_Remover():
             pass
 
         self.pipeline = pipeline.to(self.device, torch_dtype)
-        compile_flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '0').lower() in {'1', 'true', 'yes', 'on'}
-        if compile_flag and hasattr(torch, "compile"):
+        if _should_compile_for_device(self.device):
             _ensure_inductor_cudagraphs_disabled()
             try:
                 compiled_unet = torch.compile(self.pipeline.unet, mode='reduce-overhead')

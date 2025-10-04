@@ -24,6 +24,7 @@ import xatlas
 
 UV_CACHE: "OrderedDict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
 UV_CACHE_SIZE = int(os.environ.get('HY3DGEN_UV_CACHE_SIZE', 8))
+UV_CACHE_LOCK = threading.Lock()
 
 
 class _AtlasWrapper:
@@ -76,18 +77,19 @@ def mesh_uv_wrap(mesh):
             cache_key = None
 
     if cache_key is not None:
-        cached = UV_CACHE.get(cache_key)
-        if cached is not None:
-            cached_vertices, cached_faces, cached_uvs = cached
-            mesh.vertices = cached_vertices.copy()
-            mesh.faces = cached_faces.copy()
-            mesh.visual.uv = cached_uvs.copy()
-            hunyuan_meta = metadata.setdefault('hunyuan3d', {})
-            hunyuan_meta['uv_wrapped'] = True
-            hunyuan_meta['uv_cache_key'] = cache_key
-            UV_CACHE.move_to_end(cache_key)
-            mesh.metadata = metadata
-            return mesh
+        with UV_CACHE_LOCK:
+            cached = UV_CACHE.get(cache_key)
+            if cached is not None:
+                cached_vertices, cached_faces, cached_uvs = cached
+                mesh.vertices = cached_vertices.copy()
+                mesh.faces = cached_faces.copy()
+                mesh.visual.uv = cached_uvs.copy()
+                hunyuan_meta = metadata.setdefault('hunyuan3d', {})
+                hunyuan_meta['uv_wrapped'] = True
+                hunyuan_meta['uv_cache_key'] = cache_key
+                UV_CACHE.move_to_end(cache_key)
+                mesh.metadata = metadata
+                return mesh
 
     positions = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.uint32)
@@ -102,10 +104,11 @@ def mesh_uv_wrap(mesh):
     hunyuan_meta = metadata.setdefault('hunyuan3d', {})
     hunyuan_meta['uv_wrapped'] = True
     if cache_key is not None and UV_CACHE_SIZE > 0:
-        UV_CACHE[cache_key] = (mesh.vertices.copy(), mesh.faces.copy(), mesh.visual.uv.copy())
-        while len(UV_CACHE) > UV_CACHE_SIZE:
-            UV_CACHE.popitem(last=False)
-        hunyuan_meta['uv_cache_key'] = cache_key
+        with UV_CACHE_LOCK:
+            UV_CACHE[cache_key] = (mesh.vertices.copy(), mesh.faces.copy(), mesh.visual.uv.copy())
+            while len(UV_CACHE) > UV_CACHE_SIZE:
+                UV_CACHE.popitem(last=False)
+            hunyuan_meta['uv_cache_key'] = cache_key
     mesh.metadata = metadata
 
     return mesh

@@ -30,6 +30,9 @@ import importlib
 logger = logging.getLogger(__name__)
 
 
+from .dehighlight_utils import _ensure_inductor_cudagraphs_disabled, _should_compile_for_device
+
+
 class Multiview_Diffusion_Net():
     def __init__(self, config) -> None:
         self.device = config.device
@@ -123,6 +126,21 @@ class Multiview_Diffusion_Net():
         except Exception:  # pragma: no cover - optional optimization
             pass
         self.pipeline = pipeline.to(self.device, self.torch_dtype)
+
+        if _should_compile_for_device(self.device):
+            _ensure_inductor_cudagraphs_disabled()
+            try:
+                compiled_unet = torch.compile(self.pipeline.unet, mode='reduce-overhead')
+            except Exception:
+                logger.debug('torch.compile failed for Multiview UNet', exc_info=True)
+            else:
+                if isinstance(compiled_unet, torch.nn.Module):
+                    if hasattr(self.pipeline.unet, 'config') and not hasattr(compiled_unet, 'config'):
+                        compiled_unet.config = self.pipeline.unet.config
+                    self.pipeline.unet = compiled_unet
+                    logger.info('Enabled torch.compile for multiview UNet.')
+                else:
+                    logger.debug('torch.compile returned non-module for multiview UNet; skipping optimisation.')
 
     def seed_everything(self, seed):
         random.seed(seed)

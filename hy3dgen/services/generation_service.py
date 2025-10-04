@@ -32,34 +32,66 @@ from hy3dgen.texgen import Hunyuan3DPaintPipeline
 logger = logging.getLogger(__name__)
 
 
+def _resolve_cuda_device_index(device: str) -> Optional[int]:
+    if not torch.cuda.is_available() or not device.startswith('cuda'):
+        return None
+    idx = torch.cuda.current_device()
+    if device != 'cuda':
+        try:
+            idx = int(device.split(':', 1)[1])
+        except (IndexError, ValueError):
+            logger.debug('Unable to parse CUDA device index from %s; using current device.', device)
+    return idx
+
+
+def _device_supports_bf16(device: str) -> bool:
+    idx = _resolve_cuda_device_index(device)
+    if idx is None:
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(idx)
+        if major < 9:  # Limit automatic enablement to Hopper (SM90) or newer
+            return False
+    except Exception:
+        logger.debug('Unable to resolve CUDA capability; assuming bf16 unsupported.', exc_info=True)
+        return False
+    if hasattr(torch.cuda, 'is_bf16_supported'):
+        try:
+            return bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            logger.debug('torch.cuda.is_bf16_supported probe failed; assuming unsupported.', exc_info=True)
+            return False
+    return True
+
+
 def _select_default_dtype(device: str) -> torch.dtype:
     """Resolve the working dtype for diffusion modules with a safe default."""
-    # Runtime opt-in for bf16 to avoid accidental dtype mismatches with legacy fp16 weights.
-    prefer_bf16 = os.environ.get('HY3DGEN_USE_BF16', '0').lower() in {'1', 'true', 'yes'}
-    if not prefer_bf16:
+    prefer_setting = os.environ.get('HY3DGEN_USE_BF16', '').strip().lower()
+    if prefer_setting in {'0', 'false', 'no', 'off'}:
         return torch.float16
-    if not torch.cuda.is_available() or not device.startswith('cuda'):
-        logger.warning('HY3DGEN_USE_BF16 requested but CUDA unavailable; using float16 instead.')
-        return torch.float16
-    try:
-        if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+    if prefer_setting in {'1', 'true', 'yes', 'on'}:
+        if _device_supports_bf16(device):
             return torch.bfloat16
-    except Exception:
-        logger.debug('torch.cuda.is_bf16_supported check failed; defaulting to float16.', exc_info=True)
+        logger.warning('HY3DGEN_USE_BF16 requested but device lacks bf16 support; using float16 instead.')
         return torch.float16
-    try:
-        idx = torch.cuda.current_device()
-        if device != 'cuda':
-            try:
-                idx = int(device.split(':', 1)[1])
-            except (IndexError, ValueError):
-                pass
-        major, _ = torch.cuda.get_device_capability(idx)
-        if major >= 8:
-            return torch.bfloat16
-    except Exception:
-        logger.debug('Unable to resolve CUDA capability; defaulting to float16.', exc_info=True)
+    # Auto-detect: prefer bf16 on Hopper-class hardware by default.
+    if _device_supports_bf16(device):
+        return torch.bfloat16
     return torch.float16
+
+
+def _device_supports_torch_compile(device: str) -> bool:
+    if not hasattr(torch, 'compile'):
+        return False
+    idx = _resolve_cuda_device_index(device)
+    if idx is None:
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(idx)
+        return major >= 9
+    except Exception:
+        logger.debug('torch.compile support probe failed; defaulting to disabled.', exc_info=True)
+        return False
 
 
 def _try_compile_module(module: Optional[torch.nn.Module], *, mode: str = 'reduce-overhead') -> Tuple[Optional[torch.nn.Module], bool]:
@@ -118,23 +150,23 @@ class ShapeGenerationSettings:
 @dataclass
 class TextureGenerationSettings:
     enabled: bool = True
-    face_count: int = 20000
+    face_count: int = 15000
     delight_steps: int = 20
-    multiview_steps: int = 12
+    multiview_steps: int = 8
     reuse_delighting: bool = False
     delight_cache_size: int = 8
     seed: Optional[int] = 0
     adaptive_face_count: bool = True
-    adaptive_face_ratio: float = 0.05
+    adaptive_face_ratio: float = 0.035
     min_face_count: int = 10000
-    max_face_count: int = 20000
+    max_face_count: int = 15000
     high_detail_surface_area: float = 5.0
     high_detail_density: float = 0.43
     high_detail_original_ratio: float = 1.5
+    multiview_preset: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.delight_steps = max(1, int(self.delight_steps))
-        self.multiview_steps = max(1, int(self.multiview_steps))
         self.delight_cache_size = max(0, int(self.delight_cache_size))
         self.adaptive_face_ratio = float(self.adaptive_face_ratio) if self.adaptive_face_ratio else 0.1
         self.min_face_count = max(1, int(self.min_face_count))
@@ -148,6 +180,22 @@ class TextureGenerationSettings:
             self.seed = int(self.seed)
         else:
             self.seed = None
+        preset = (self.multiview_preset or '').strip().lower()
+        if preset:
+            preset_map = {
+                'fast': 6,
+                'balanced': 8,
+                'quality': 12,
+                'ultra': 16,
+            }
+            steps = preset_map.get(preset)
+            if steps is not None:
+                self.multiview_steps = steps
+            else:
+                logger.warning('Unknown multiview_preset "%s"; using explicit multiview_steps=%s', preset, self.multiview_steps)
+        else:
+            self.multiview_preset = None
+        self.multiview_steps = max(1, int(self.multiview_steps))
         if self.face_count is not None:
             self.face_count = int(self.face_count)
             if self.face_count < self.min_face_count:
@@ -421,10 +469,14 @@ class GenerationService:
         return target
 
     def _maybe_compile_texture_models(self) -> None:
-        if self._texture_compiled or not hasattr(torch, "compile") or not self.texture_pipeline:
+        if self._texture_compiled or not self.texture_pipeline:
             return
-        flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '0')
-        if flag.lower() not in {'1', 'true', 'yes', 'on'}:
+        env_pref = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '').strip().lower()
+        if env_pref in {'0', 'false', 'no', 'off'}:
+            return
+        if not hasattr(torch, 'compile'):
+            return
+        if env_pref not in {'1', 'true', 'yes', 'on'} and not _device_supports_torch_compile(self.device):
             return
         _ensure_inductor_cudagraphs_disabled()
         compiled = []

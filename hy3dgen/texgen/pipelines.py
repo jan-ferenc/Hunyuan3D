@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 
+import concurrent.futures
 import logging
 import numpy as np
 import os
@@ -259,6 +260,21 @@ class Hunyuan3DPaintPipeline:
 
         images_prompt = [self.recenter_image(image_prompt) for image_prompt in images_prompt]
 
+        uv_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        uv_future: Optional[concurrent.futures.Future] = None
+        uv_start: Optional[float] = None
+        try:
+            uv_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            uv_start = time.perf_counter()
+            uv_future = uv_executor.submit(mesh_uv_wrap, mesh)
+        except Exception:
+            logger.debug('Unable to schedule background UV unwrap; will unwrap synchronously.', exc_info=True)
+            if uv_executor is not None:
+                uv_executor.shutdown(wait=False)
+            uv_executor = None
+            uv_future = None
+            uv_start = None
+
         delighted_images = []
         for image_prompt in images_prompt:
             delight_start = time.perf_counter()
@@ -274,9 +290,23 @@ class Hunyuan3DPaintPipeline:
             delighted_images.append(delighted)
         images_prompt = delighted_images
 
-        uv_start = time.perf_counter()
-        mesh = mesh_uv_wrap(mesh)
-        logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', time.perf_counter() - uv_start, len(mesh.faces))
+        if uv_future is not None:
+            try:
+                mesh = uv_future.result()
+                elapsed = time.perf_counter() - uv_start if uv_start is not None else 0.0
+                logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', elapsed, len(mesh.faces))
+            except Exception:
+                logger.exception('Background UV unwrap failed; retrying synchronously')
+                sync_start = time.perf_counter()
+                mesh = mesh_uv_wrap(mesh)
+                logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', time.perf_counter() - sync_start, len(mesh.faces))
+            finally:
+                if uv_executor is not None:
+                    uv_executor.shutdown(wait=False)
+        else:
+            sync_start = time.perf_counter()
+            mesh = mesh_uv_wrap(mesh)
+            logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', time.perf_counter() - sync_start, len(mesh.faces))
 
         load_start = time.perf_counter()
         self.render.load_mesh(mesh)
