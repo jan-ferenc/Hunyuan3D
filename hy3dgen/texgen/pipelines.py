@@ -40,10 +40,11 @@ logger = logging.getLogger(__name__)
 
 class Hunyuan3DTexGenConfig:
 
-    def __init__(self, light_remover_ckpt_path, multiview_ckpt_path, subfolder_name):
+    def __init__(self, light_remover_ckpt_path, multiview_ckpt_path, subfolder_name, torch_dtype=torch.float16):
         self.device = 'cuda'
         self.light_remover_ckpt_path = light_remover_ckpt_path
         self.multiview_ckpt_path = multiview_ckpt_path
+        self.torch_dtype = torch_dtype
 
         self.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
         self.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
@@ -60,7 +61,7 @@ class Hunyuan3DTexGenConfig:
 
 class Hunyuan3DPaintPipeline:
     @classmethod
-    def from_pretrained(cls, model_path, subfolder='hunyuan3d-paint-v2-0-turbo'):
+    def from_pretrained(cls, model_path, subfolder='hunyuan3d-paint-v2-0-turbo', torch_dtype=torch.float16):
         original_model_path = model_path
         if not os.path.exists(model_path):
             # try local path
@@ -95,18 +96,18 @@ class Hunyuan3DPaintPipeline:
                     cls._ensure_safetensors(model_path, subfolder)
                     delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
                     multiview_model_path = os.path.join(model_path, subfolder)
-                    return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder))
+                    return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder, torch_dtype=torch_dtype))
                 except Exception:
                     import traceback
                     traceback.print_exc()
                     raise RuntimeError(f"Something wrong while loading {model_path}")
             else:
-                return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder))
+                return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder, torch_dtype=torch_dtype))
         else:
             delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
             multiview_model_path = os.path.join(model_path, subfolder)
             cls._ensure_safetensors(model_path, subfolder)
-            return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder))
+            return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder, torch_dtype=torch_dtype))
 
     def __init__(self, config):
         self.config = config

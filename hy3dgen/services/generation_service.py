@@ -32,6 +32,30 @@ from hy3dgen.texgen import Hunyuan3DPaintPipeline
 logger = logging.getLogger(__name__)
 
 
+def _select_default_dtype(device: str) -> torch.dtype:
+    """Prefer bf16 on supported CUDA devices to reduce cast overhead."""
+    if not torch.cuda.is_available() or not device.startswith('cuda'):
+        return torch.float16
+    try:
+        if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+    except Exception:
+        logger.debug('torch.cuda.is_bf16_supported check failed; defaulting to float16.', exc_info=True)
+    try:
+        idx = torch.cuda.current_device()
+        if device != 'cuda':
+            try:
+                idx = int(device.split(':', 1)[1])
+            except (IndexError, ValueError):
+                pass
+        major, _ = torch.cuda.get_device_capability(idx)
+        if major >= 8:
+            return torch.bfloat16
+    except Exception:
+        logger.debug('Unable to resolve CUDA capability; defaulting to float16.', exc_info=True)
+    return torch.float16
+
+
 @dataclass
 class ShapeGenerationSettings:
     num_inference_steps: int = 4
@@ -110,8 +134,10 @@ class GenerationService:
         shape_model_subfolder: str = 'hunyuan3d-dit-v2-mini-turbo',
         tex_model_subfolder: str = 'hunyuan3d-paint-v2-0-turbo',
         output_dir: Optional[str] = None,
+        model_dtype: Optional[torch.dtype] = None,
     ) -> None:
         self.device = device
+        self.dtype: torch.dtype = model_dtype or _select_default_dtype(device)
         self.rembg = BackgroundRemover()
 
         try:
@@ -142,6 +168,7 @@ class GenerationService:
         self.shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
             model_path,
             device=device,
+            dtype=self.dtype,
             enable_flashvdm=True,
             use_safetensors=False,
             subfolder=shape_model_subfolder,
@@ -155,6 +182,7 @@ class GenerationService:
             self.shape_pipeline.vae.surface_extractor = SurfaceExtractors['mc']()
         except Exception:  # pragma: no cover - fallback to diffusers default if configuration fails
             logger.warning('Unable to configure default surface extractor; continuing with pipeline defaults.', exc_info=True)
+        self._compile_shape_pipeline()
 
         self.float_remover = FloaterRemover()
         self.degenerate_face_remover = DegenerateFaceRemover()
@@ -168,6 +196,7 @@ class GenerationService:
                 self.texture_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
                     tex_model_path,
                     subfolder=tex_model_subfolder,
+                    torch_dtype=self.dtype,
                 )
                 self._maybe_compile_texture_models()
             except Exception as exc:
@@ -346,7 +375,8 @@ class GenerationService:
     def _maybe_compile_texture_models(self) -> None:
         if self._texture_compiled or not hasattr(torch, "compile") or not self.texture_pipeline:
             return
-        if os.environ.get('HY3DGEN_TEXTURE_COMPILE', '0') not in {'1', 'true', 'TRUE', 'True'}:
+        flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', 'auto')
+        if isinstance(flag, str) and flag.lower() in {'0', 'false', 'off'}:
             return
         compiled = []
         try:
@@ -368,6 +398,18 @@ class GenerationService:
         if compiled:
             self._texture_compiled = True
             logger.info('Enabled torch.compile for texture modules: %s', ', '.join(compiled))
+
+    def _compile_shape_pipeline(self) -> None:
+        if not hasattr(torch, "compile"):
+            return
+        compile_fn = getattr(self.shape_pipeline, 'compile', None)
+        if compile_fn is None:
+            return
+        try:
+            compile_fn()
+            logger.info('Enabled torch.compile for shape pipeline modules.')
+        except Exception:
+            logger.debug('torch.compile failed for shape pipeline', exc_info=True)
 
     def _warmup_pipelines(self) -> None:
         start_time = time.perf_counter()
@@ -437,13 +479,22 @@ class GenerationService:
 
     def export_mesh(
         self,
-        mesh: trimesh.Trimesh,
+        mesh: Optional[trimesh.Trimesh],
         job_id: str,
         *,
         textured: bool = False,
+        mesh_bytes: Optional[bytes] = None,
         file_type: str = 'glb',
     ) -> str:
         path = self.resolve_export_path(job_id, textured=textured, file_type=file_type)
+
+        if mesh_bytes is not None:
+            path.write_bytes(mesh_bytes)
+            logger.info('Saved %s mesh to %s', 'textured' if textured else 'generated', path)
+            return str(path)
+
+        if mesh is None:
+            raise ValueError('mesh or mesh_bytes must be provided when exporting a mesh')
 
         export_kwargs = {}
         if file_type.lower() in {'glb', 'gltf'}:

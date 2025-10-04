@@ -186,20 +186,19 @@ def _schedule_background_task(coro: Awaitable[None]) -> None:
     task.add_done_callback(lambda finished: _background_exports.discard(finished))
 
 
-async def _export_mesh_background(mesh, run_id: str, *, textured: bool) -> None:
+async def _export_mesh_background(mesh, run_id: str, *, textured: bool, mesh_bytes: Optional[bytes] = None) -> None:
     if generation_service is None:
         return
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            None,
-            partial(
-                generation_service.export_mesh,
-                mesh,
-                run_id,
-                textured=textured,
-            ),
+        export_job = partial(
+            generation_service.export_mesh,
+            mesh,
+            run_id,
+            textured=textured,
+            mesh_bytes=mesh_bytes,
         )
+        await loop.run_in_executor(None, export_job)
     except Exception:  # pragma: no cover - best effort persistence
         logger.exception(
             "Background export failed for job %s (textured=%s)",
@@ -435,12 +434,12 @@ async def stream_generation(
                     mesh_event["parent_job"] = job_id
                 yield json.dumps(mesh_event) + "\n"
 
-                mesh_copy_for_disk = mesh.copy()
                 _schedule_background_task(
                     _export_mesh_background(
-                        mesh_copy_for_disk,
+                        None if mesh_bytes else mesh,
                         run_id,
                         textured=False,
+                        mesh_bytes=mesh_bytes,
                     )
                 )
 
@@ -489,12 +488,12 @@ async def stream_generation(
                             textured_event["parent_job"] = job_id
                         yield json.dumps(textured_event) + "\n"
 
-                        textured_copy_for_disk = textured_mesh.copy()
                         _schedule_background_task(
                             _export_mesh_background(
-                                textured_copy_for_disk,
+                                None if textured_bytes else textured_mesh,
                                 run_id,
                                 textured=True,
+                                mesh_bytes=textured_bytes,
                             )
                         )
                     else:

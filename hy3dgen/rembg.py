@@ -18,7 +18,13 @@ from rembg import remove, new_session
 
 class BackgroundRemover():
     def __init__(self):
-        self.session = new_session()
+        providers = None
+        try:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            self.session = new_session(model_name="u2net", providers=providers)
+        except Exception:
+            # Fall back to default CPU session if CUDA provider is unavailable.
+            self.session = new_session()
 
     def __call__(self, image: Image.Image):
         output = remove(image, session=self.session, bgcolor=[255, 255, 255, 0])

@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import cv2
+import logging
 import numpy as np
 import torch
 from PIL import Image
@@ -21,6 +22,9 @@ import hashlib
 from collections import OrderedDict
 import threading
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class Light_Shadow_Remover():
@@ -34,9 +38,11 @@ class Light_Shadow_Remover():
         self.default_cache_size = 8
         self.default_seed = 42
 
+        torch_dtype = getattr(config, 'torch_dtype', torch.float16)
+
         pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
             config.light_remover_ckpt_path,
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
             safety_checker=None,
         )
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config)
@@ -46,7 +52,13 @@ class Light_Shadow_Remover():
         except Exception:  # pragma: no cover - best effort, do not fail on missing dependency
             pass
 
-        self.pipeline = pipeline.to(self.device, torch.float16)
+        self.pipeline = pipeline.to(self.device, torch_dtype)
+        if hasattr(torch, "compile"):
+            try:
+                self.pipeline.unet = torch.compile(self.pipeline.unet, mode='reduce-overhead')
+                logger.info('Enabled torch.compile for Light_Shadow_Remover UNet.')
+            except Exception:
+                logger.debug('torch.compile failed for Light_Shadow_Remover UNet', exc_info=True)
 
     def _make_cache_key(self, image: Image.Image, steps: int, seed: int) -> str:
         # Hash resized RGBA bytes to avoid redundant pix2pix invocations.

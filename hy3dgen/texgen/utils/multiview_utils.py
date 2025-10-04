@@ -38,6 +38,7 @@ class Multiview_Diffusion_Net():
         self.default_steps = 30
         self.default_seed = 0
         self._inference_lock = threading.Lock()
+        self.torch_dtype = getattr(config, 'torch_dtype', torch.float16)
 
         current_file_path = os.path.abspath(__file__)
         custom_pipeline_path = os.path.join(os.path.dirname(current_file_path), '..', 'hunyuanpaint')
@@ -46,7 +47,7 @@ class Multiview_Diffusion_Net():
             return DiffusionPipeline.from_pretrained(
                 multiview_ckpt_path,
                 custom_pipeline=custom_pipeline_path,
-                torch_dtype=torch.float16,
+                torch_dtype=self.torch_dtype,
             )
 
         try:
@@ -93,7 +94,7 @@ class Multiview_Diffusion_Net():
                 pipeline.unet.__class__ = expected_unet_cls
             else:
                 unet_path = os.path.join(multiview_ckpt_path, 'unet')
-                dtype = getattr(pipeline.unet, 'dtype', torch.float16)
+                dtype = getattr(pipeline.unet, 'dtype', self.torch_dtype)
                 device = pipeline.device
                 logger.info('Reloading UNet weights into expected class from %s', unet_mod.__name__)
                 try:
@@ -121,7 +122,7 @@ class Multiview_Diffusion_Net():
             pipeline.enable_xformers_memory_efficient_attention()
         except Exception:  # pragma: no cover - optional optimization
             pass
-        self.pipeline = pipeline.to(self.device)
+        self.pipeline = pipeline.to(self.device, self.torch_dtype)
 
     def seed_everything(self, seed):
         random.seed(seed)
