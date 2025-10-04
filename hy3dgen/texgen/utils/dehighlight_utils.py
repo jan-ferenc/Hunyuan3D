@@ -55,10 +55,17 @@ class Light_Shadow_Remover():
         self.pipeline = pipeline.to(self.device, torch_dtype)
         if hasattr(torch, "compile"):
             try:
-                self.pipeline.unet = torch.compile(self.pipeline.unet, mode='reduce-overhead')
-                logger.info('Enabled torch.compile for Light_Shadow_Remover UNet.')
+                compiled_unet = torch.compile(self.pipeline.unet, mode='reduce-overhead')
             except Exception:
                 logger.debug('torch.compile failed for Light_Shadow_Remover UNet', exc_info=True)
+            else:
+                if isinstance(compiled_unet, torch.nn.Module):
+                    if hasattr(self.pipeline.unet, 'config') and not hasattr(compiled_unet, 'config'):
+                        compiled_unet.config = self.pipeline.unet.config
+                    self.pipeline.unet = compiled_unet
+                    logger.info('Enabled torch.compile for Light_Shadow_Remover UNet.')
+                else:
+                    logger.debug('torch.compile returned non-module for Light_Shadow_Remover UNet; skipping optimisation.')
 
     def _make_cache_key(self, image: Image.Image, steps: int, seed: int) -> str:
         # Hash resized RGBA bytes to avoid redundant pix2pix invocations.

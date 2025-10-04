@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import trimesh
@@ -60,6 +60,24 @@ def _select_default_dtype(device: str) -> torch.dtype:
     except Exception:
         logger.debug('Unable to resolve CUDA capability; defaulting to float16.', exc_info=True)
     return torch.float16
+
+
+def _try_compile_module(module: Optional[torch.nn.Module], *, mode: str = 'reduce-overhead') -> Tuple[Optional[torch.nn.Module], bool]:
+    if module is None or not hasattr(torch, "compile"):
+        return module, False
+    try:
+        compiled = torch.compile(module, mode=mode)
+    except Exception:
+        logger.debug('torch.compile failed for %s', getattr(module, '__class__', type(module)), exc_info=True)
+        return module, False
+    if not isinstance(compiled, torch.nn.Module):
+        logger.debug('torch.compile returned non-module for %s; skipping optimisation.', getattr(module, '__class__', type(module)))
+        return module, False
+    # Preserve common metadata used downstream (e.g., diffusers expects `.config`).
+    for attr in ("config",):
+        if hasattr(module, attr) and not hasattr(compiled, attr):
+            setattr(compiled, attr, getattr(module, attr))
+    return compiled, True
 
 
 @dataclass
@@ -389,16 +407,20 @@ class GenerationService:
             delight = self.texture_pipeline.models.get('delight_model') if hasattr(self.texture_pipeline, 'models') else None
             pipe = getattr(delight, 'pipeline', None)
             if pipe is not None and hasattr(pipe, 'unet'):
-                pipe.unet = torch.compile(pipe.unet, mode='reduce-overhead')
-                compiled.append('delight_unet')
+                compiled_unet, ok = _try_compile_module(pipe.unet)
+                if ok:
+                    pipe.unet = compiled_unet
+                    compiled.append('delight_unet')
         except Exception:
             logger.debug('torch.compile failed for delight_model', exc_info=True)
         try:
             multiview = self.texture_pipeline.models.get('multiview_model') if hasattr(self.texture_pipeline, 'models') else None
             pipe = getattr(multiview, 'pipeline', None)
             if pipe is not None and hasattr(pipe, 'unet'):
-                pipe.unet = torch.compile(pipe.unet, mode='reduce-overhead')
-                compiled.append('multiview_unet')
+                compiled_unet, ok = _try_compile_module(pipe.unet)
+                if ok:
+                    pipe.unet = compiled_unet
+                    compiled.append('multiview_unet')
         except Exception:
             logger.debug('torch.compile failed for multiview_model', exc_info=True)
         if compiled:
