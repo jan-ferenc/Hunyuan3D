@@ -33,14 +33,20 @@ logger = logging.getLogger(__name__)
 
 
 def _select_default_dtype(device: str) -> torch.dtype:
-    """Prefer bf16 on supported CUDA devices to reduce cast overhead."""
+    """Resolve the working dtype for diffusion modules with a safe default."""
+    # Runtime opt-in for bf16 to avoid accidental dtype mismatches with legacy fp16 weights.
+    prefer_bf16 = os.environ.get('HY3DGEN_USE_BF16', '0').lower() in {'1', 'true', 'yes'}
+    if not prefer_bf16:
+        return torch.float16
     if not torch.cuda.is_available() or not device.startswith('cuda'):
+        logger.warning('HY3DGEN_USE_BF16 requested but CUDA unavailable; using float16 instead.')
         return torch.float16
     try:
         if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
             return torch.bfloat16
     except Exception:
         logger.debug('torch.cuda.is_bf16_supported check failed; defaulting to float16.', exc_info=True)
+        return torch.float16
     try:
         idx = torch.cuda.current_device()
         if device != 'cuda':
