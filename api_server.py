@@ -29,12 +29,12 @@ import sys
 import uuid
 import time
 from pathlib import Path
-from typing import Any, AsyncGenerator, Awaitable, Dict, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
@@ -187,6 +187,22 @@ def _schedule_background_task(coro: Awaitable[None]) -> None:
     task.add_done_callback(lambda finished: _background_exports.discard(finished))
 
 
+async def _memory_mesh_stream(data: bytes, chunk_size: int = 65536) -> AsyncIterator[bytes]:
+    view = memoryview(data)
+    for start in range(0, len(view), chunk_size):
+        yield view[start:start + chunk_size]
+
+
+async def _file_mesh_stream(path: Path, chunk_size: int = 65536) -> AsyncIterator[bytes]:
+    loop = asyncio.get_running_loop()
+    with path.open('rb') as handle:
+        while True:
+            chunk = await loop.run_in_executor(None, handle.read, chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+
 async def _export_mesh_background(mesh, run_id: str, *, textured: bool, mesh_bytes: Optional[bytes] = None) -> None:
     if generation_service is None:
         return
@@ -314,7 +330,11 @@ async def serve_job_asset(cache_key: str, variant: str):
     normalized_variant = "textured" if variant.lower().startswith("textured") else "mesh"
     cached = await _get_cached_mesh_bytes(cache_key, normalized_variant)
     if cached is not None:
-        return Response(content=cached, media_type="model/gltf-binary")
+        return StreamingResponse(
+            _memory_mesh_stream(cached),
+            media_type="model/gltf-binary",
+            headers={"Content-Length": str(len(cached))},
+        )
 
     if generation_service is not None:
         try:
@@ -326,7 +346,12 @@ async def serve_job_asset(cache_key: str, variant: str):
             logger.warning("Failed to resolve export path for %s: %s", cache_key, exc)
         else:
             if path.exists():
-                return FileResponse(path, media_type="model/gltf-binary")
+                headers = {"Content-Length": str(path.stat().st_size)}
+                return StreamingResponse(
+                    _file_mesh_stream(path),
+                    media_type="model/gltf-binary",
+                    headers=headers,
+                )
 
     raise HTTPException(status_code=404, detail="Mesh asset not found")
 
