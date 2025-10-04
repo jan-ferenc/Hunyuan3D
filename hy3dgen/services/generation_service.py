@@ -67,16 +67,16 @@ def _device_supports_bf16(device: str) -> bool:
 def _select_default_dtype(device: str) -> torch.dtype:
     """Resolve the working dtype for diffusion modules with a safe default."""
     prefer_setting = os.environ.get('HY3DGEN_USE_BF16', '').strip().lower()
-    if prefer_setting in {'0', 'false', 'no', 'off'}:
-        return torch.float16
     if prefer_setting in {'1', 'true', 'yes', 'on'}:
         if _device_supports_bf16(device):
             return torch.bfloat16
         logger.warning('HY3DGEN_USE_BF16 requested but device lacks bf16 support; using float16 instead.')
         return torch.float16
-    # Auto-detect: prefer bf16 on Hopper-class hardware by default.
-    if _device_supports_bf16(device):
-        return torch.bfloat16
+    if prefer_setting in {'auto'}:
+        if _device_supports_bf16(device):
+            return torch.bfloat16
+        logger.warning('HY3DGEN_USE_BF16=auto but device lacks bf16 support; using float16.')
+        return torch.float16
     return torch.float16
 
 
