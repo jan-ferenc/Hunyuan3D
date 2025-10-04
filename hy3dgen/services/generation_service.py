@@ -399,8 +399,8 @@ class GenerationService:
     def _maybe_compile_texture_models(self) -> None:
         if self._texture_compiled or not hasattr(torch, "compile") or not self.texture_pipeline:
             return
-        flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', 'auto')
-        if isinstance(flag, str) and flag.lower() in {'0', 'false', 'off'}:
+        flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '0')
+        if flag.lower() not in {'1', 'true', 'yes', 'on'}:
             return
         compiled = []
         try:

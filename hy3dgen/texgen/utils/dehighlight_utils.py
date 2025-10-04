@@ -15,6 +15,7 @@
 import cv2
 import logging
 import numpy as np
+import os
 import torch
 from PIL import Image
 from diffusers import StableDiffusionInstructPix2PixPipeline, EulerAncestralDiscreteScheduler
@@ -53,7 +54,8 @@ class Light_Shadow_Remover():
             pass
 
         self.pipeline = pipeline.to(self.device, torch_dtype)
-        if hasattr(torch, "compile"):
+        compile_flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '0').lower() in {'1', 'true', 'yes', 'on'}
+        if compile_flag and hasattr(torch, "compile"):
             try:
                 compiled_unet = torch.compile(self.pipeline.unet, mode='reduce-overhead')
             except Exception:
