@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 from collections import OrderedDict
 from functools import partial
 import json
@@ -352,6 +353,30 @@ async def stream_generation(
                 image_payload = await loop.run_in_executor(None, imagen_client.generate, user_query)
                 image_ready = time.perf_counter()
 
+                async def _prepare_and_generate_mesh():
+                    conditioning = await loop.run_in_executor(
+                        None,
+                        generation_service.prepare_image,
+                        image_payload,
+                    )
+                    mesh_result = await loop.run_in_executor(
+                        None,
+                        generation_service.generate_mesh,
+                        conditioning,
+                        shape_settings,
+                    )
+                    mesh_result = await loop.run_in_executor(
+                        None,
+                        partial(
+                            generation_service.standardize_mesh,
+                            mesh_result,
+                            texture_settings=texture_settings,
+                        ),
+                    )
+                    return conditioning, mesh_result
+
+                mesh_task = asyncio.create_task(_prepare_and_generate_mesh())
+
                 image_seconds = image_ready - run_start
                 try:
                     pil_image = image_payload.as_pil()
@@ -373,24 +398,15 @@ async def stream_generation(
                     image_event["run"] = run_idx + 1
                     image_event["runs_total"] = benchmark_runs
                     image_event["parent_job"] = job_id
-                yield json.dumps(image_event) + "\n"
+                try:
+                    yield json.dumps(image_event) + "\n"
+                except BaseException:
+                    mesh_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await mesh_task
+                    raise
 
-                conditioning_image = await loop.run_in_executor(None, generation_service.prepare_image, image_payload)
-
-                mesh = await loop.run_in_executor(
-                    None,
-                    generation_service.generate_mesh,
-                    conditioning_image,
-                    shape_settings,
-                )
-                mesh = await loop.run_in_executor(
-                    None,
-                    partial(
-                        generation_service.standardize_mesh,
-                        mesh,
-                        texture_settings=texture_settings,
-                    ),
-                )
+                conditioning_image, mesh = await mesh_task
                 cache_key = GenerationService.sanitize_job_id(run_id)
                 mesh_path = generation_service.resolve_export_path(run_id, textured=False)
                 mesh_bytes = await loop.run_in_executor(

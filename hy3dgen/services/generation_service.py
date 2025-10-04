@@ -6,6 +6,7 @@ import logging
 import concurrent.futures
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from io import BytesIO
@@ -250,6 +251,13 @@ class GenerationService:
         self.device = device
         self.dtype: torch.dtype = model_dtype or _select_default_dtype(device)
         self.rembg = BackgroundRemover()
+        gen_device = device if isinstance(device, str) and device.startswith('cuda') else 'cpu'
+        try:
+            self._shape_generator = torch.Generator(device=gen_device)
+        except RuntimeError:
+            self._shape_generator = torch.Generator()
+        self._shape_generator.manual_seed(torch.seed())
+        self._shape_generator_lock = threading.Lock()
 
         try:
             torch.set_float32_matmul_precision("high")
@@ -331,21 +339,38 @@ class GenerationService:
         image: Image.Image,
         settings: ShapeGenerationSettings,
     ) -> trimesh.Trimesh:
-        generator = None
+        gen_device = self.device if (isinstance(self.device, str) and self.device.startswith('cuda') and torch.cuda.is_available()) else 'cpu'
         if settings.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(settings.seed)
+            try:
+                seeded_generator = torch.Generator(device=gen_device)
+            except RuntimeError:
+                seeded_generator = torch.Generator()
+            seeded_generator.manual_seed(settings.seed)
+            meshes = self.shape_pipeline(
+                image=image,
+                num_inference_steps=settings.num_inference_steps,
+                guidance_scale=settings.guidance_scale,
+                box_v=settings.box_v,
+                octree_resolution=settings.octree_resolution,
+                num_chunks=settings.num_chunks,
+                mc_algo=settings.mc_algo,
+                generator=seeded_generator,
+                output_type='trimesh',
+            )
+            return meshes[0]
 
-        meshes = self.shape_pipeline(
-            image=image,
-            num_inference_steps=settings.num_inference_steps,
-            guidance_scale=settings.guidance_scale,
-            box_v=settings.box_v,
-            octree_resolution=settings.octree_resolution,
-            num_chunks=settings.num_chunks,
-            mc_algo=settings.mc_algo,
-            generator=generator,
-            output_type='trimesh',
-        )
+        with self._shape_generator_lock:
+            meshes = self.shape_pipeline(
+                image=image,
+                num_inference_steps=settings.num_inference_steps,
+                guidance_scale=settings.guidance_scale,
+                box_v=settings.box_v,
+                octree_resolution=settings.octree_resolution,
+                num_chunks=settings.num_chunks,
+                mc_algo=settings.mc_algo,
+                generator=self._shape_generator,
+                output_type='trimesh',
+            )
         return meshes[0]
 
     def standardize_mesh(

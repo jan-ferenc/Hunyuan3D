@@ -260,20 +260,39 @@ class Hunyuan3DPaintPipeline:
 
         images_prompt = [self.recenter_image(image_prompt) for image_prompt in images_prompt]
 
-        uv_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-        uv_future: Optional[concurrent.futures.Future] = None
-        uv_start: Optional[float] = None
+        selected_camera_elevs = self.config.candidate_camera_elevs
+        selected_camera_azims = self.config.candidate_camera_azims
+        selected_view_weights = self.config.candidate_view_weights
+
+        def _prepare_mesh_assets(mesh_input):
+            unwrap_start = time.perf_counter()
+            wrapped_mesh = mesh_uv_wrap(mesh_input)
+            unwrap_elapsed = time.perf_counter() - unwrap_start
+            load_start = time.perf_counter()
+            self.render.load_mesh(wrapped_mesh)
+            load_elapsed = time.perf_counter() - load_start
+            normals = self.render_normal_multiview(
+                selected_camera_elevs,
+                selected_camera_azims,
+                use_abs_coor=True,
+            )
+            positions = self.render_position_multiview(
+                selected_camera_elevs,
+                selected_camera_azims,
+            )
+            return wrapped_mesh, unwrap_elapsed, load_elapsed, normals, positions
+
+        prep_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        prep_future: Optional[concurrent.futures.Future] = None
         try:
-            uv_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            uv_start = time.perf_counter()
-            uv_future = uv_executor.submit(mesh_uv_wrap, mesh)
+            prep_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            prep_future = prep_executor.submit(_prepare_mesh_assets, mesh)
         except Exception:
-            logger.debug('Unable to schedule background UV unwrap; will unwrap synchronously.', exc_info=True)
-            if uv_executor is not None:
-                uv_executor.shutdown(wait=False)
-            uv_executor = None
-            uv_future = None
-            uv_start = None
+            logger.debug('Unable to schedule background mesh preparation; will prepare synchronously.', exc_info=True)
+            if prep_executor is not None:
+                prep_executor.shutdown(wait=False)
+            prep_executor = None
+            prep_future = None
 
         delighted_images = []
         for image_prompt in images_prompt:
@@ -290,35 +309,51 @@ class Hunyuan3DPaintPipeline:
             delighted_images.append(delighted)
         images_prompt = delighted_images
 
-        if uv_future is not None:
+        if prep_future is not None:
             try:
-                mesh = uv_future.result()
-                elapsed = time.perf_counter() - uv_start if uv_start is not None else 0.0
-                logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', elapsed, len(mesh.faces))
+                mesh, uv_elapsed, load_elapsed, normal_maps, position_maps = prep_future.result()
+                logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', uv_elapsed, len(mesh.faces))
+                logger.debug('Texture load_mesh completed in %.3fs', load_elapsed)
             except Exception:
-                logger.exception('Background UV unwrap failed; retrying synchronously')
+                logger.exception('Background mesh preparation failed; retrying synchronously')
                 sync_start = time.perf_counter()
                 mesh = mesh_uv_wrap(mesh)
-                logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', time.perf_counter() - sync_start, len(mesh.faces))
+                uv_elapsed = time.perf_counter() - sync_start
+                logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', uv_elapsed, len(mesh.faces))
+                load_start = time.perf_counter()
+                self.render.load_mesh(mesh)
+                load_elapsed = time.perf_counter() - load_start
+                logger.debug('Texture load_mesh completed in %.3fs', load_elapsed)
+                normal_maps = self.render_normal_multiview(
+                    selected_camera_elevs,
+                    selected_camera_azims,
+                    use_abs_coor=True,
+                )
+                position_maps = self.render_position_multiview(
+                    selected_camera_elevs,
+                    selected_camera_azims,
+                )
             finally:
-                if uv_executor is not None:
-                    uv_executor.shutdown(wait=False)
+                if prep_executor is not None:
+                    prep_executor.shutdown(wait=False)
         else:
             sync_start = time.perf_counter()
             mesh = mesh_uv_wrap(mesh)
-            logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', time.perf_counter() - sync_start, len(mesh.faces))
-
-        load_start = time.perf_counter()
-        self.render.load_mesh(mesh)
-        logger.debug('Texture load_mesh completed in %.3fs', time.perf_counter() - load_start)
-
-        selected_camera_elevs, selected_camera_azims, selected_view_weights = \
-            self.config.candidate_camera_elevs, self.config.candidate_camera_azims, self.config.candidate_view_weights
-
-        normal_maps = self.render_normal_multiview(
-            selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
-        position_maps = self.render_position_multiview(
-            selected_camera_elevs, selected_camera_azims)
+            uv_elapsed = time.perf_counter() - sync_start
+            logger.debug('Texture UV unwrap completed in %.3fs (faces=%s)', uv_elapsed, len(mesh.faces))
+            load_start = time.perf_counter()
+            self.render.load_mesh(mesh)
+            load_elapsed = time.perf_counter() - load_start
+            logger.debug('Texture load_mesh completed in %.3fs', load_elapsed)
+            normal_maps = self.render_normal_multiview(
+                selected_camera_elevs,
+                selected_camera_azims,
+                use_abs_coor=True,
+            )
+            position_maps = self.render_position_multiview(
+                selected_camera_elevs,
+                selected_camera_azims,
+            )
 
         camera_info = [(((azim // 30) + 9) % 12) // {-20: 1, 0: 1, 20: 1, -90: 3, 90: 3}[
             elev] + {-20: 0, 0: 12, 20: 24, -90: 36, 90: 40}[elev] for azim, elev in
