@@ -824,6 +824,6 @@ class MeshRender():
             255 -
             mask,
             3,
-            cv2.INPAINT_NS)
+            cv2.INPAINT_TELEA)
 
         return texture_np

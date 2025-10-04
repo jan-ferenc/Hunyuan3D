@@ -25,6 +25,11 @@ from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, LCMScheduler
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline as BasePipeline
 
+try:  # Prefer PyTorch SDPA / FlashAttention 2 when available
+    from diffusers.models.attention_processor import AttnProcessor2_0
+except ImportError:  # pragma: no cover - keep compatibility with older diffusers releases
+    AttnProcessor2_0 = None
+
 import importlib
 
 logger = logging.getLogger(__name__)
@@ -121,10 +126,12 @@ class Multiview_Diffusion_Net():
             # pipeline.prepare() 
 
         pipeline.set_progress_bar_config(disable=True)
-        try:  # best effort to leverage memory efficient attention when available
-            pipeline.enable_xformers_memory_efficient_attention()
-        except Exception:  # pragma: no cover - optional optimization
-            pass
+        if AttnProcessor2_0 is not None and hasattr(pipeline.unet, "set_attn_processor"):
+            try:
+                pipeline.unet.set_attn_processor(AttnProcessor2_0())
+                logger.info('Enabled AttnProcessor2_0 for Multiview UNet.')
+            except Exception:  # pragma: no cover - continue without SDPA if setup fails
+                logger.debug('Failed to apply AttnProcessor2_0; using default attention for multiview UNet.', exc_info=True)
         self.pipeline = pipeline.to(self.device, self.torch_dtype)
 
         if _should_compile_for_device(self.device):

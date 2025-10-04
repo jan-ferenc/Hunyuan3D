@@ -19,6 +19,11 @@ import os
 import torch
 from PIL import Image
 from diffusers import StableDiffusionInstructPix2PixPipeline, EulerAncestralDiscreteScheduler
+
+try:  # diffusers >=0.21 provides AttnProcessor2_0 for SDPA/FlashAttention 2
+    from diffusers.models.attention_processor import AttnProcessor2_0
+except ImportError:  # pragma: no cover - keep backward compatibility
+    AttnProcessor2_0 = None
 import hashlib
 from collections import OrderedDict
 import threading
@@ -94,10 +99,12 @@ class Light_Shadow_Remover():
         )
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config)
         pipeline.set_progress_bar_config(disable=True)
-        try:  # Optional acceleration when xformers is available
-            pipeline.enable_xformers_memory_efficient_attention()
-        except Exception:  # pragma: no cover - best effort, do not fail on missing dependency
-            pass
+        if AttnProcessor2_0 is not None and hasattr(pipeline.unet, "set_attn_processor"):
+            try:
+                pipeline.unet.set_attn_processor(AttnProcessor2_0())
+                logger.info('Enabled AttnProcessor2_0 for Light_Shadow_Remover UNet.')
+            except Exception:  # pragma: no cover - fall back silently if SDPA setup fails
+                logger.debug('Failed to apply AttnProcessor2_0; continuing with default attention.', exc_info=True)
 
         self.pipeline = pipeline.to(self.device, torch_dtype)
         if _should_compile_for_device(self.device):
