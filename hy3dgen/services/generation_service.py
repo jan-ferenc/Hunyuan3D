@@ -140,6 +140,17 @@ def _ensure_inductor_cudagraphs_disabled() -> None:
         _ensure_inductor_cudagraphs_disabled._applied = True  # type: ignore[attr-defined]
 
 
+def _module_to_channels_last(module: Optional[torch.nn.Module]) -> bool:
+    if module is None:
+        return False
+    try:
+        module.to(memory_format=torch.channels_last)
+    except Exception:
+        logger.debug('Unable to convert %s to channels_last layout', type(module), exc_info=True)
+        return False
+    return True
+
+
 @dataclass
 class ShapeGenerationSettings:
     num_inference_steps: int = 4
@@ -283,6 +294,7 @@ class GenerationService:
         except Exception:  # pragma: no cover - fallback to diffusers default if configuration fails
             logger.warning('Unable to configure default surface extractor; continuing with pipeline defaults.', exc_info=True)
         self._compile_shape_pipeline()
+        self._apply_shape_channels_last()
 
         self.float_remover = FloaterRemover()
         self.degenerate_face_remover = DegenerateFaceRemover()
@@ -299,6 +311,7 @@ class GenerationService:
                     torch_dtype=self.dtype,
                 )
                 self._maybe_compile_texture_models()
+                self._apply_texture_channels_last()
             except Exception as exc:
                 logger.warning(
                     "Texture pipeline unavailable (%s); continuing with texture generation disabled.",
@@ -508,6 +521,46 @@ class GenerationService:
         if compiled:
             self._texture_compiled = True
             logger.info('Enabled torch.compile for texture modules: %s', ', '.join(compiled))
+
+    def _apply_shape_channels_last(self) -> None:
+        device_str = str(self.device)
+        if not (torch.cuda.is_available() and device_str.startswith('cuda')):
+            return
+        converted: list[str] = []
+        if _module_to_channels_last(getattr(self.shape_pipeline, 'model', None)):
+            converted.append('shape_unet')
+        if _module_to_channels_last(getattr(self.shape_pipeline, 'vae', None)):
+            converted.append('shape_vae')
+        if _module_to_channels_last(getattr(self.shape_pipeline, 'conditioner', None)):
+            converted.append('shape_conditioner')
+        if converted:
+            logger.info('Applied channels_last layout to %s', ', '.join(converted))
+
+    def _apply_texture_channels_last(self) -> None:
+        device_str = str(self.device)
+        if not (self.texture_pipeline and torch.cuda.is_available() and device_str.startswith('cuda')):
+            return
+        converted: list[str] = []
+        models = getattr(self.texture_pipeline, 'models', {})
+        delight = models.get('delight_model') if isinstance(models, dict) else None
+        multiview = models.get('multiview_model') if isinstance(models, dict) else None
+
+        delight_pipeline = getattr(delight, 'pipeline', None)
+        if delight_pipeline is not None:
+            if _module_to_channels_last(getattr(delight_pipeline, 'unet', None)):
+                converted.append('delight_unet')
+            if _module_to_channels_last(getattr(delight_pipeline, 'vae', None)):
+                converted.append('delight_vae')
+
+        multiview_pipeline = getattr(multiview, 'pipeline', None)
+        if multiview_pipeline is not None:
+            if _module_to_channels_last(getattr(multiview_pipeline, 'unet', None)):
+                converted.append('multiview_unet')
+            if _module_to_channels_last(getattr(multiview_pipeline, 'vae', None)):
+                converted.append('multiview_vae')
+
+        if converted:
+            logger.info('Applied channels_last layout to %s', ', '.join(converted))
 
     def _compile_shape_pipeline(self) -> None:
         if not hasattr(torch, "compile"):
