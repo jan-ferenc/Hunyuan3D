@@ -50,12 +50,14 @@ def _ensure_inductor_cudagraphs_disabled() -> None:
 
 def _should_compile_for_device(device: str) -> bool:
     pref = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '').strip().lower()
-    if pref in {'0', 'false', 'no', 'off'}:
+    if pref in {'', '0', 'false', 'no', 'off'}:
         return False
     if not hasattr(torch, 'compile'):
         return False
     if pref in {'1', 'true', 'yes', 'on'}:
         return True
+    if pref != 'auto':
+        return False
     if not torch.cuda.is_available() or not device.startswith('cuda'):
         return False
     try:

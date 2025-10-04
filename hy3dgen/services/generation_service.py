@@ -94,6 +94,10 @@ def _device_supports_torch_compile(device: str) -> bool:
         return False
 
 
+def _texture_compile_requested() -> str:
+    return os.environ.get('HY3DGEN_TEXTURE_COMPILE', '').strip().lower()
+
+
 def _try_compile_module(module: Optional[torch.nn.Module], *, mode: str = 'reduce-overhead') -> Tuple[Optional[torch.nn.Module], bool]:
     if module is None or not hasattr(torch, "compile"):
         return module, False
@@ -471,13 +475,14 @@ class GenerationService:
     def _maybe_compile_texture_models(self) -> None:
         if self._texture_compiled or not self.texture_pipeline:
             return
-        env_pref = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '').strip().lower()
-        if env_pref in {'0', 'false', 'no', 'off'}:
+        env_pref = _texture_compile_requested()
+        if env_pref in {'', '0', 'false', 'no', 'off'}:
             return
         if not hasattr(torch, 'compile'):
             return
-        if env_pref not in {'1', 'true', 'yes', 'on'} and not _device_supports_torch_compile(self.device):
-            return
+        if env_pref not in {'1', 'true', 'yes', 'on'}:
+            if env_pref != 'auto' or not _device_supports_torch_compile(self.device):
+                return
         _ensure_inductor_cudagraphs_disabled()
         compiled = []
         try:
