@@ -28,6 +28,26 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _ensure_inductor_cudagraphs_disabled() -> None:
+    if getattr(_ensure_inductor_cudagraphs_disabled, '_applied', False):
+        return
+    try:
+        from torch._inductor import config as inductor_config  # type: ignore
+    except Exception:
+        logger.debug('torch._inductor.config unavailable for cudagraph toggle.', exc_info=True)
+        _ensure_inductor_cudagraphs_disabled._applied = True  # type: ignore[attr-defined]
+        return
+    try:
+        current = getattr(getattr(inductor_config, 'triton', None), 'cudagraphs', None)
+        if current is not None and current is not False:
+            inductor_config.triton.cudagraphs = False
+            logger.info('Disabled torch._inductor.triton.cudagraphs for delight torch.compile path.')
+    except Exception:
+        logger.debug('Unable to disable torch._inductor.triton.cudagraphs in delight helper.', exc_info=True)
+    finally:
+        _ensure_inductor_cudagraphs_disabled._applied = True  # type: ignore[attr-defined]
+
+
 class Light_Shadow_Remover():
     def __init__(self, config):
         self.device = config.device
@@ -56,6 +76,7 @@ class Light_Shadow_Remover():
         self.pipeline = pipeline.to(self.device, torch_dtype)
         compile_flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '0').lower() in {'1', 'true', 'yes', 'on'}
         if compile_flag and hasattr(torch, "compile"):
+            _ensure_inductor_cudagraphs_disabled()
             try:
                 compiled_unet = torch.compile(self.pipeline.unet, mode='reduce-overhead')
             except Exception:

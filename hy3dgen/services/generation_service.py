@@ -80,6 +80,30 @@ def _try_compile_module(module: Optional[torch.nn.Module], *, mode: str = 'reduc
     return compiled, True
 
 
+def _ensure_inductor_cudagraphs_disabled() -> None:
+    """Disable CUDA graph capture in torch.compile runtime to avoid unsupported ops."""
+    if getattr(_ensure_inductor_cudagraphs_disabled, '_applied', False):
+        return
+    try:
+        from torch._inductor import config as inductor_config  # type: ignore
+    except Exception:
+        logger.debug('torch._inductor.config unavailable; cannot tweak cudagraph settings.', exc_info=True)
+        _ensure_inductor_cudagraphs_disabled._applied = True  # type: ignore[attr-defined]
+        return
+    try:
+        current = getattr(getattr(inductor_config, 'triton', None), 'cudagraphs', None)
+        if current is False:
+            _ensure_inductor_cudagraphs_disabled._applied = True  # type: ignore[attr-defined]
+            return
+        if current is not None:
+            inductor_config.triton.cudagraphs = False
+            logger.info('Disabled torch._inductor.triton.cudagraphs for texture torch.compile path.')
+    except Exception:
+        logger.debug('Failed to disable torch._inductor.triton.cudagraphs; continuing with defaults.', exc_info=True)
+    finally:
+        _ensure_inductor_cudagraphs_disabled._applied = True  # type: ignore[attr-defined]
+
+
 @dataclass
 class ShapeGenerationSettings:
     num_inference_steps: int = 4
@@ -402,6 +426,7 @@ class GenerationService:
         flag = os.environ.get('HY3DGEN_TEXTURE_COMPILE', '0')
         if flag.lower() not in {'1', 'true', 'yes', 'on'}:
             return
+        _ensure_inductor_cudagraphs_disabled()
         compiled = []
         try:
             delight = self.texture_pipeline.models.get('delight_model') if hasattr(self.texture_pipeline, 'models') else None
