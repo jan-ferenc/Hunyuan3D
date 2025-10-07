@@ -12,19 +12,34 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import logging
+
 from PIL import Image
 from rembg import remove, new_session
 
 
 class BackgroundRemover():
     def __init__(self):
+        self.logger = logging.getLogger(__name__)
         providers = None
         try:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             self.session = new_session(model_name="u2net", providers=providers)
         except Exception:
+            self.logger.warning(
+                "Falling back to rembg default providers; unable to initialize CUDAExecutionProvider.",
+                exc_info=True,
+            )
             # Fall back to default CPU session if CUDA provider is unavailable.
             self.session = new_session()
+        finally:
+            # rembg>=2.0.60 exposes `providers` attribute (list[str]).
+            # Older versions expose the getter on the ONNX session instead.
+            session_providers = getattr(self.session, "providers", None)
+            if session_providers is None:
+                session_providers = getattr(getattr(self.session, "session", None), "get_providers", lambda: None)()
+            if session_providers:
+                self.logger.info("rembg session providers: %s", session_providers)
 
     def __call__(self, image: Image.Image):
         output = remove(image, session=self.session, bgcolor=[255, 255, 255, 0])

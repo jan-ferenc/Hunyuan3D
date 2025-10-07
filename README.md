@@ -14,6 +14,8 @@ If you still need to install the Python dependencies, activate the virtual envir
 pip install -r requirements.txt
 ```
 
+The requirements pin `rembg[gpu]` with `onnxruntime-gpu`, so background removal uses CUDA by default on deployment servers with NVIDIA GPUs.
+
 ## Launching the API Server
 
 Follow these steps from your terminal in order:

@@ -35,7 +35,7 @@ gradio
 fastapi
 uvicorn
 google-genai
-rembg
-onnxruntime
+rembg[gpu]
+onnxruntime-gpu
 #gevent
 #geventhttpclient
