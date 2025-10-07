@@ -31,6 +31,7 @@ else:
 
 
 from .differentiable_renderer.mesh_render import MeshRender
+from .differentiable_renderer import mesh_render_gpu_inpaint_patch  # noqa: F401  # Apply GPU inpainting patch
 from .utils.dehighlight_utils import Light_Shadow_Remover
 from .utils.multiview_utils import Multiview_Diffusion_Net
 from .utils.imagesuper_utils import Image_Super_Net
