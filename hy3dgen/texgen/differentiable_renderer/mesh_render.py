@@ -12,6 +12,10 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import logging
+import os
+import time
+
 import cv2
 import numpy as np
 import torch
@@ -27,6 +31,9 @@ from .camera_utils import (
 )
 from .mesh_processor import meshVerticeInpaint
 from .mesh_utils import load_mesh, save_mesh
+
+# Add a module-level logger
+logger = logging.getLogger(__name__)
 
 
 def stride_from_shape(shape):
@@ -804,26 +811,367 @@ class MeshRender():
         return texture_merge, trust_map_merge > 1E-8
 
     def uv_inpaint(self, texture, mask):
+        """
+        Inpaint a UV texture map using a GPU-first path (Poisson + diffusion with seam screening),
+        falling back to OpenCV Telea on CPU. Returns numpy uint8 [H,W,C].
+        `mask` is uint8 where 255 indicates known texels and 0 indicates holes.
+        """
 
+        # -------- helpers (nested to minimize file-wide churn) ----------------
+        def _to_tensor_image(device, x):
+            """Convert numpy/torch/PIL to torch float [1,C,H,W] in [0,1]."""
+            if isinstance(x, torch.Tensor):
+                t = x.detach()
+                if t.dim() == 2:
+                    t = t.unsqueeze(-1)
+                if t.dim() == 3:
+                    t = t.permute(2, 0, 1).unsqueeze(0)
+                elif t.dim() == 4:
+                    pass
+                else:
+                    raise ValueError("Unsupported tensor dim for image")
+                t = t.to(device=device, dtype=torch.float32).clamp_(0, 1)
+                return t
+            elif isinstance(x, np.ndarray):
+                arr = x.astype(np.float32)
+                if arr.ndim == 2:
+                    arr = arr[..., None]
+                if arr.max() > 1.0:
+                    arr = arr / 255.0
+                t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+                return t.to(device=device, dtype=torch.float32).clamp_(0, 1)
+            elif isinstance(x, Image.Image):
+                return _to_tensor_image(device, np.array(x))
+            else:
+                raise ValueError("Unsupported image type")
+
+        def _from_tensor_image(x):
+            """Convert [1,C,H,W] float in [0,1] to uint8 numpy [H,W,C]."""
+            if not isinstance(x, torch.Tensor):
+                raise ValueError("Expected torch.Tensor")
+            t = x.detach().clamp_(0, 1)
+            if t.dim() == 4:
+                t = t[0]
+            t = t.permute(1, 2, 0).contiguous()
+            return (t.cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+
+        def _conv2d_same(x, weight):
+            """Grouped conv2d with replicate padding. x:[1,C,H,W], w:[C,1,kh,kw]."""
+            kh, kw = weight.shape[-2], weight.shape[-1]
+            ph, pw = kh // 2, kw // 2
+            xpad = F.pad(x, pad=(pw, pw, ph, ph), mode="replicate")
+            return F.conv2d(xpad, weight, groups=x.shape[1])
+
+        def _build_4nbr_kernel(channels, device, dtype):
+            k = torch.zeros((channels, 1, 3, 3), device=device, dtype=dtype)
+            k[:, 0, 1, 0] = 1.0
+            k[:, 0, 0, 1] = 1.0
+            k[:, 0, 1, 2] = 1.0
+            k[:, 0, 2, 1] = 1.0
+            return k
+
+        def _build_laplacian_kernel(channels, device, dtype):
+            k = torch.zeros((channels, 1, 3, 3), device=device, dtype=dtype)
+            k[:, 0, 1, 0] = 1.0
+            k[:, 0, 0, 1] = 1.0
+            k[:, 0, 1, 2] = 1.0
+            k[:, 0, 2, 1] = 1.0
+            k[:, 0, 1, 1] = -4.0
+            return k
+
+        def _make_box_kernels(channels, radius, device, dtype):
+            k = 2 * radius + 1
+            kh = torch.ones((channels, 1, 1, k), device=device, dtype=dtype) / float(k)
+            kv = torch.ones((channels, 1, k, 1), device=device, dtype=dtype) / float(k)
+            return kh, kv
+
+        def _gpu_inpaint_diffusion(U0, unknown_mask, iters=12, schedule=(2, 2, 2, 1, 1, 1, 1), use_amp=True):
+            """Fast separable masked diffusion; updates only unknowns."""
+            device = U0.device
+            C = U0.shape[1]
+            U = U0.clone()
+            dtype = torch.float16 if (use_amp and device.type == "cuda") else torch.float32
+            for t in range(iters):
+                r = schedule[t] if t < len(schedule) else schedule[-1]
+                kh, kv = _make_box_kernels(C, r, device, dtype)
+                with torch.autocast(device_type="cuda", dtype=dtype, enabled=(device.type == "cuda" and use_amp)):
+                    Uh = _conv2d_same(U, kh)
+                    Ub = _conv2d_same(Uh, kv)
+                Ub = Ub.to(torch.float32)
+                U = torch.where(unknown_mask, Ub, U0)
+            return U
+
+        def _build_seam_constraint_maps(U0, vtx_pos, pos_idx, vtx_uv, uv_idx, H, W, lambda_seam=1.0):
+            """
+            Build seam weight/target maps by tying UV duplicates of the same 3D vertex.
+            Returns seam_w:[1,1,H,W], seam_t:[1,C,H,W] float32 (device of U0).
+            """
+            import numpy as _np
+            from collections import defaultdict
+
+            # Normalize to numpy
+            def _to_np(a):
+                if isinstance(a, torch.Tensor):
+                    return a.detach().cpu().numpy()
+                return a
+
+            pos_idx_np = _to_np(pos_idx)
+            uv_idx_np = _to_np(uv_idx)
+            vtx_uv_np = _to_np(vtx_uv)
+
+            pos_to_uvs = defaultdict(set)
+            tri_count = pos_idx_np.shape[0]
+            for f in range(tri_count):
+                p0, p1, p2 = int(pos_idx_np[f, 0]), int(pos_idx_np[f, 1]), int(pos_idx_np[f, 2])
+                u0, u1, u2 = int(uv_idx_np[f, 0]), int(uv_idx_np[f, 1]), int(uv_idx_np[f, 2])
+                pos_to_uvs[p0].add(u0)
+                pos_to_uvs[p1].add(u1)
+                pos_to_uvs[p2].add(u2)
+
+            groups = []
+            for _, uvs in pos_to_uvs.items():
+                uv_list = list(uvs)
+                if len(uv_list) <= 1:
+                    continue
+                coords = []
+                for u in uv_list:
+                    x = int(_np.clip(round(vtx_uv_np[u, 0] * (W - 1)), 0, W - 1))
+                    y = int(_np.clip(round(vtx_uv_np[u, 1] * (H - 1)), 0, H - 1))
+                    coords.append((y, x))
+                coords = list(dict.fromkeys(coords))
+                if len(coords) <= 1:
+                    continue
+                groups.append(coords)
+
+            device = U0.device
+            C = U0.shape[1]
+            seam_w = torch.zeros((1, 1, H, W), device=device, dtype=torch.float32)
+            seam_t = torch.zeros((1, C, H, W), device=device, dtype=torch.float32)
+            if not groups:
+                return seam_w, seam_t
+
+            for coords in groups:
+                ys = torch.tensor([y for (y, _) in coords], device=device, dtype=torch.long)
+                xs = torch.tensor([x for (_, x) in coords], device=device, dtype=torch.long)
+                colors = U0[0, :, ys, xs]  # [C,K]
+                group_mean = colors.mean(dim=1, keepdim=True)  # [C,1]
+                seam_t[0, :, ys, xs] = group_mean
+                seam_w[0, 0, ys, xs] = float(lambda_seam)
+
+            # Light dilation/averaging to stabilize
+            ones3 = torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32)
+            w_d = F.conv2d(F.pad(seam_w, (1, 1, 1, 1), mode="replicate"), ones3)
+            num = F.conv2d(F.pad(seam_w * seam_t.sum(1, keepdim=True), (1, 1, 1, 1), mode="replicate"), ones3)
+            w_d = torch.clamp(w_d, min=1e-6)
+            t_avg = num / w_d
+            seam_t = t_avg.repeat(1, C, 1, 1).clamp_(0.0, 1.0)
+            seam_w = w_d.clamp_max_(lambda_seam * 9.0)
+            return seam_w, seam_t
+
+        def _gpu_inpaint_poisson(
+            U0,
+            unknown_mask,
+            iters=220,
+            tol=1e-3,
+            omega=0.66,
+            seam_w=None,
+            seam_t=None,
+            use_amp=True,
+            use_graph=True,
+            graph_key=None,
+        ):
+            """Harmonic inpainting via masked weighted-Jacobi with optional seam screening."""
+            device = U0.device
+            C = U0.shape[1]
+            dtype_amp = torch.float16 if (device.type == "cuda" and use_amp) else torch.float32
+            k4 = _build_4nbr_kernel(C, device, dtype_amp)
+            klap = _build_laplacian_kernel(C, device, dtype_amp)
+
+            # Lazy cache for CUDA graphs
+            if not hasattr(self, "_inpaint_graphs"):
+                self._inpaint_graphs = {}
+
+            U = U0.clone()
+
+            def _iterate(U):
+                with torch.autocast(device_type="cuda", dtype=dtype_amp, enabled=(device.type == "cuda" and use_amp)):
+                    ns = _conv2d_same(U, k4)
+                    denom = 4.0
+                    if seam_w is not None and seam_t is not None:
+                        ns = ns + seam_w * seam_t
+                        denom = denom + seam_w
+                    Unew = ns / denom
+                Unew = Unew.to(torch.float32)
+                Urelax = omega * Unew + (1.0 - omega) * U
+                return torch.where(unknown_mask, Urelax, U0)
+
+            if device.type == "cuda" and use_graph:
+                key = graph_key or (tuple(U0.shape), bool(seam_w is not None))
+                ctx = self._inpaint_graphs.get(key)
+                if ctx is None:
+                    static = {
+                        "U": U.clone(),
+                        "U0": U0.clone(),
+                        "mask": unknown_mask.clone(),
+                        "seam_w": torch.zeros_like(unknown_mask) if seam_w is None else seam_w.clone(),
+                        "seam_t": torch.zeros_like(U0) if seam_t is None else seam_t.clone(),
+                    }
+                    g = torch.cuda.CUDAGraph()
+                    torch.cuda.synchronize()
+                    with torch.cuda.graph(g):
+                        U_static = static["U"]
+                        for _ in range(iters):
+                            with torch.autocast(device_type="cuda", dtype=dtype_amp, enabled=(device.type == "cuda" and use_amp)):
+                                ns = _conv2d_same(U_static, k4)
+                                denom = 4.0 + static["seam_w"]
+                                ns = ns + static["seam_w"] * static["seam_t"]
+                                Unew = ns / denom
+                            Unew = Unew.to(torch.float32)
+                            Urelax = omega * Unew + (1.0 - omega) * U_static
+                            U_static.copy_(torch.where(static["mask"], Urelax, static["U0"]))
+                    ctx = {"g": g, "static": static}
+                    self._inpaint_graphs[key] = ctx
+                # Copy inputs and replay
+                s = ctx["static"]
+                s["U"].copy_(U)
+                s["U0"].copy_(U0)
+                s["mask"].copy_(unknown_mask)
+                if seam_w is not None:
+                    s["seam_w"].copy_(seam_w)
+                    s["seam_t"].copy_(seam_t if seam_t is not None else torch.zeros_like(U0))
+                else:
+                    s["seam_w"].zero_()
+                    s["seam_t"].zero_()
+                ctx["g"].replay()
+                U = ctx["static"]["U"]
+            else:
+                check_every = max(10, iters // 10)
+                for i in range(iters):
+                    U = _iterate(U)
+                    if (i + 1) % check_every == 0:
+                        L = _conv2d_same(U, klap).to(torch.float32)
+                        if seam_w is not None and seam_t is not None:
+                            L = L + seam_w * (U - seam_t)
+                        r = torch.sqrt((L * L).mean())
+                        if r.item() < tol:
+                            break
+            return U
+
+        def _gpu_inpaint_auto(texture_np, mask_np, vtx_pos, vtx_uv, pos_idx, uv_idx):
+            """Auto-select diffusion/poisson/hybrid and run on CUDA if available."""
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            start_all = time.perf_counter()
+
+            U0 = _to_tensor_image(device, texture_np)  # [1,C,H,W], [0,1]
+            H, W = U0.shape[-2], U0.shape[-1]
+            unknown_mask = torch.from_numpy((mask_np == 0).astype(np.bool_)).to(device).view(1, 1, H, W)
+
+            method_env = os.getenv("HY3DGEN_INPAINT_METHOD", "auto").lower()
+            use_amp = os.getenv("HY3DGEN_INPAINT_PRECISION", "fp16").lower() == "fp16"
+            use_graphs = os.getenv("HY3DGEN_INPAINT_USE_GRAPHS", "1") == "1"
+            lambda_seam = float(os.getenv("HY3DGEN_INPAINT_SEAM_LAMBDA", "1.0"))
+            area_frac = float(unknown_mask.float().mean().item())
+
+            # Optional seam constraints
+            seam_w, seam_t = None, None
+            try:
+                seam_w, seam_t = _build_seam_constraint_maps(
+                    U0, vtx_pos, pos_idx, vtx_uv, uv_idx, H, W, lambda_seam=lambda_seam
+                )
+            except Exception as e:
+                logger.debug("Seam constraint build failed; continuing without. %s", e, exc_info=True)
+
+            def _run_poisson(U_init):
+                t0 = time.perf_counter()
+                U = _gpu_inpaint_poisson(
+                    U_init,
+                    unknown_mask,
+                    iters=int(os.getenv("HY3DGEN_INPAINT_ITERS", "220")),
+                    tol=float(os.getenv("HY3DGEN_INPAINT_TOL", "1e-3")),
+                    omega=float(os.getenv("HY3DGEN_INPAINT_OMEGA", "0.66")),
+                    seam_w=seam_w,
+                    seam_t=seam_t,
+                    use_amp=use_amp,
+                    use_graph=use_graphs,
+                    graph_key=("poisson", tuple(U_init.shape), seam_w is not None),
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                logger.debug("GPU Poisson inpaint: %.3f ms", (time.perf_counter() - t0) * 1000.0)
+                return U
+
+            def _run_diffusion(U_init, iters=12):
+                t0 = time.perf_counter()
+                U = _gpu_inpaint_diffusion(
+                    U_init, unknown_mask, iters=iters, schedule=(2, 2, 2, 1, 1, 1, 1), use_amp=use_amp
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                logger.debug("GPU diffusion prefill: %.3f ms", (time.perf_counter() - t0) * 1000.0)
+                return U
+
+            if method_env == "cpu":
+                logger.debug("HY3DGEN_INPAINT_METHOD=cpu, skipping GPU path.")
+                return None
+
+            if method_env == "diffusion" or (method_env == "auto" and area_frac < 0.05):
+                U_prefill = _run_diffusion(U0, iters=int(os.getenv("HY3DGEN_DIFF_ITERS", "12")))
+                U = _run_poisson(U_prefill) if method_env == "auto" else U_prefill
+            elif method_env == "poisson" or method_env == "auto":
+                if method_env == "auto" and area_frac < 0.20:
+                    U_prefill = _run_diffusion(U0, iters=6)
+                    U = _run_poisson(U_prefill)
+                else:
+                    U = _run_poisson(U0)
+            else:
+                U = _run_poisson(U0)
+
+            out = _from_tensor_image(U)
+            logger.debug(
+                "GPU inpaint total: %.3f ms (area=%.2f%%)",
+                (time.perf_counter() - start_all) * 1000.0,
+                area_frac * 100.0,
+            )
+            return out
+
+        # -------- end helpers -----------------------------------------------
+
+        # Normalize incoming texture to numpy float32 [H,W,C] in [0,1]
         if isinstance(texture, torch.Tensor):
-            texture_np = texture.cpu().numpy()
+            texture_np = texture.detach().cpu().numpy()
         elif isinstance(texture, np.ndarray):
             texture_np = texture
         elif isinstance(texture, Image.Image):
-            texture_np = np.array(texture) / 255.0
+            texture_np = np.array(texture)
+        else:
+            raise ValueError("Unsupported texture type")
+        if texture_np.dtype != np.float32 and texture_np.dtype != np.float64:
+            texture_np = texture_np.astype(np.float32)
+        if texture_np.max() > 1.0:
+            texture_np = texture_np / 255.0
 
+        # Gather mesh info and apply existing vertex-space inpaint prep
         vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
+        texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
 
-        texture_np, mask = meshVerticeInpaint(
-            texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+        # Try GPU path first
+        use_gpu = (os.getenv("HY3DGEN_GPU_INPAINT", "1") == "1") and torch.cuda.is_available()
+        method_env = os.getenv("HY3DGEN_INPAINT_METHOD", "auto").lower()
+        if use_gpu and method_env != "cpu":
+            try:
+                start_gpu = time.perf_counter()
+                out_np = _gpu_inpaint_auto(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+                if out_np is None:
+                    raise RuntimeError("GPU inpaint skipped by method=cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                logger.debug("uv_inpaint: GPU path completed in %.3f ms", (time.perf_counter() - start_gpu) * 1000.0)
+                return out_np
+            except Exception as e:
+                logger.exception("GPU inpaint failed; falling back to CPU Telea. Reason: %s", e)
 
-        texture_np = cv2.inpaint(
-            (texture_np *
-             255).astype(
-                np.uint8),
-            255 -
-            mask,
-            3,
-            cv2.INPAINT_TELEA)
-
-        return texture_np
+        # CPU Telea fallback
+        start_cpu = time.perf_counter()
+        out_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_TELEA)
+        logger.debug("uv_inpaint: CPU Telea completed in %.3f ms", (time.perf_counter() - start_cpu) * 1000.0)
+        return out_np
