@@ -231,6 +231,27 @@ def _voxel_decimate(mesh: GPUMesh, target_faces: int, max_iters: int = 8, min_ra
         sums.index_add_(0, inv, verts)
         centers = sums / counts.unsqueeze(1)
 
+        # Snap cluster representatives back onto the original surface (medoid).
+        dist2 = torch.sum((verts - centers[inv]) ** 2, dim=1)
+        num_clusters = q_unique.shape[0]
+        cluster_min = torch.full((num_clusters,), float('inf'), device=device)
+        cluster_min.scatter_reduce_(0, inv, dist2, reduce='amin', include_self=False)
+
+        vertex_indices = torch.arange(verts.shape[0], device=device, dtype=torch.long)
+        large_val = torch.full_like(vertex_indices, verts.shape[0] * 2)
+        matches = torch.where((dist2 - cluster_min[inv]).abs() <= 1e-8, vertex_indices, large_val)
+
+        medoid_indices = torch.full((num_clusters,), verts.shape[0] * 2, dtype=torch.long, device=device)
+        medoid_indices.scatter_reduce_(0, inv, matches, reduce='amin', include_self=False)
+
+        missing = medoid_indices >= verts.shape[0]
+        if torch.any(missing):
+            first_indices = torch.full((num_clusters,), verts.shape[0] * 2, dtype=torch.long, device=device)
+            first_indices.scatter_reduce_(0, inv, vertex_indices, reduce='amin', include_self=False)
+            medoid_indices = torch.where(missing, first_indices, medoid_indices)
+
+        centers = verts[medoid_indices]
+
         f_remap = _remap_and_dedup_faces(faces, inv)
         mesh2 = GPUMesh(centers, f_remap)
         mesh2 = _remove_degenerate_faces(mesh2)

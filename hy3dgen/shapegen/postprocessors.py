@@ -59,8 +59,14 @@ def _gpu_reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int):
     assert _GPU_POSTPROCESSOR is not None
     tm_in = pymeshlab2trimesh(mesh)
     tm_out = _GPU_POSTPROCESSOR.reduce_face(tm_in, max_facenum=max_facenum)
-    faces_out = len(getattr(tm_out, "faces", []) or [])
-    faces_in = len(getattr(tm_in, "faces", []) or [])
+    faces_arr_out = getattr(tm_out, "faces", None)
+    faces_arr_in = getattr(tm_in, "faces", None)
+    faces_out = int(faces_arr_out.shape[0]) if faces_arr_out is not None else 0
+    faces_in = int(faces_arr_in.shape[0]) if faces_arr_in is not None else 0
+    logger.debug(
+        "GPU face reduction result: input_faces=%s target=%s output_faces=%s",
+        faces_in, max_facenum, faces_out,
+    )
     target_ratio = getattr(_GPU_POSTPROCESSOR, "target_face_ratio", 0.8)
     min_expected = max(100, int(max_facenum * max(0.5, target_ratio - 0.1)))
     if faces_in >= min_expected and faces_out < min_expected:
