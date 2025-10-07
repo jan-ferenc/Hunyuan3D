@@ -200,7 +200,8 @@ def _estimate_voxel_size_to_hit_faces(mesh: GPUMesh, target_faces: int) -> float
     return float(voxel_size)
 
 
-def _voxel_decimate(mesh: GPUMesh, target_faces: int, max_iters: int = 8, min_ratio: float = 0.8) -> GPUMesh:
+def _voxel_decimate(mesh: GPUMesh, target_faces: int, max_iters: int = 6) -> GPUMesh:
+def _voxel_decimate(mesh: GPUMesh, target_faces: int, max_iters: int = 6) -> GPUMesh:
     """Fast voxel-grid decimation on GPU to approximately reach target face count."""
     if mesh.num_faces() == 0 or mesh.num_faces() <= target_faces:
         return mesh
@@ -211,26 +212,35 @@ def _voxel_decimate(mesh: GPUMesh, target_faces: int, max_iters: int = 8, min_ra
 
     # Compute bbox
     bb_min = verts.min(dim=0).values
+    bb_max = verts.max(dim=0).values
+    extent = bb_max - bb_min
+    longest = torch.max(extent).item()
+    bb_max = verts.max(dim=0).values
+    extent = bb_max - bb_min
+    longest = torch.max(extent).item()
 
     voxel_size = _estimate_voxel_size_to_hit_faces(mesh, target_faces)
-    # Bias the initial step toward preserving faces to avoid overshooting drastically.
-    voxel_size = max(voxel_size * 0.75, 1e-9)
 
-    best_mesh: Optional[GPUMesh] = None
-    best_faces: Optional[int] = None
-
+    # Iteratively adjust voxel size to approach target_faces
+    # Iteratively adjust voxel size to approach target_faces
     for it in range(max_iters):
         q = _voxel_grid_quantize(verts, voxel_size, bb_min)  # (V,3) int64
+        # Map each voxel cell to a unique id
+        # Build resolution estimate to linearize; we do not need exact res, so we use hashing approach
+        # Use a stable hash via unique on rows
+        # Map each voxel cell to a unique id
+        # Build resolution estimate to linearize; we do not need exact res, so we use hashing approach
+        # Use a stable hash via unique on rows
         q_unique, inv = torch.unique(q, dim=0, return_inverse=True)
-
+        # Compute cluster centers
+        # Compute cluster centers
         counts = torch.bincount(inv, minlength=q_unique.shape[0]).to(verts.dtype)
-        if counts.numel() == 0:
-            voxel_size *= 0.5
-            continue
         sums = torch.zeros((q_unique.shape[0], 3), dtype=verts.dtype, device=device)
         sums.index_add_(0, inv, verts)
         centers = sums / counts.unsqueeze(1)
 
+<<<<<<< ours
+<<<<<<< ours
         # Snap cluster representatives back onto the original surface (medoid).
         dist2 = torch.sum((verts - centers[inv]) ** 2, dim=1)
         num_clusters = q_unique.shape[0]
@@ -252,38 +262,48 @@ def _voxel_decimate(mesh: GPUMesh, target_faces: int, max_iters: int = 8, min_ra
 
         centers = verts[medoid_indices]
 
+=======
+        # Remap faces
+>>>>>>> theirs
+=======
+>>>>>>> theirs
         f_remap = _remap_and_dedup_faces(faces, inv)
-        mesh2 = GPUMesh(centers, f_remap)
-        mesh2 = _remove_degenerate_faces(mesh2)
+        approx_F = int(f_remap.shape[0])
 
-        approx_F = mesh2.num_faces()
-        if approx_F == 0:
-            voxel_size *= 0.5
-            continue
+        # Adjust voxel size adaptively
+        if approx_F <= target_faces or it == max_iters - 1:
+            # Commit
+            verts2 = centers
+            faces2 = f_remap
+            mesh2 = GPUMesh(verts2, faces2)
+            mesh2 = _remove_degenerate_faces(mesh2)
+        approx_F = int(f_remap.shape[0])
 
-        # Track best attempt so far (closest to target from above or below).
-        if best_mesh is None or best_faces is None or abs(approx_F - target_faces) < abs(best_faces - target_faces):
-            best_mesh = mesh2
-            best_faces = approx_F
-
-        if approx_F >= target_faces:
-            # Still above target; increase voxel size moderately.
-            factor = max(1.05, min(3.0, (approx_F / float(target_faces)) ** (1.0 / 3.0)))
-            voxel_size *= factor
-            continue
-
-        # approx_F < target_faces
-        if approx_F >= int(target_faces * min_ratio):
+        # Adjust voxel size adaptively
+        if approx_F <= target_faces or it == max_iters - 1:
+            # Commit
+            verts2 = centers
+            faces2 = f_remap
+            mesh2 = GPUMesh(verts2, faces2)
+            mesh2 = _remove_degenerate_faces(mesh2)
             return mesh2
+        else:
+            # Not enough reduction; increase voxel size (merge more)
+            # Multiply by factor proportional to (approx_F / target_faces)^(1/3)
+            factor = (approx_F / float(target_faces)) ** (1.0 / 3.0)
+            factor = max(1.1, min(4.0, factor))
+            voxel_size *= factor
+        else:
+            # Not enough reduction; increase voxel size (merge more)
+            # Multiply by factor proportional to (approx_F / target_faces)^(1/3)
+            factor = (approx_F / float(target_faces)) ** (1.0 / 3.0)
+            factor = max(1.1, min(4.0, factor))
+            voxel_size *= factor
 
-        # Too aggressive reduction; shrink voxel size to preserve more detail.
-        factor = max(0.2, min(0.9, (approx_F / max(float(target_faces), 1.0)) ** (1.0 / 3.0)))
-        voxel_size *= factor
-
-    if best_mesh is not None:
-        return best_mesh
-
-    return mesh
+    # Fallback return
+    return _remove_degenerate_faces(GPUMesh(centers, f_remap))
+    # Fallback return
+    return _remove_degenerate_faces(GPUMesh(centers, f_remap))
 
 
 def _build_edge_index_from_faces(faces: 'torch.Tensor') -> 'torch.Tensor':
@@ -439,7 +459,6 @@ class GPUMeshProcessor:
         prefer: str = 'voxel',         # 'voxel' | 'qem' (future)
         remove_degenerate_eps: float = 1e-12,
         min_component_ratio: float = 0.005,
-        target_face_ratio: float = 0.85,
     ) -> None:
         _require_torch()
         if device is None:
@@ -448,7 +467,6 @@ class GPUMeshProcessor:
         self.prefer = prefer
         self.remove_degenerate_eps = float(remove_degenerate_eps)
         self.min_component_ratio = float(min_component_ratio)
-        self.target_face_ratio = float(target_face_ratio)
 
     # ---------- Public API ----------
 
@@ -464,10 +482,12 @@ class GPUMeshProcessor:
 
         # 3) Decimation
         if self.prefer == 'voxel':
-            mesh = _voxel_decimate(mesh, target_faces=max_facenum, min_ratio=self.target_face_ratio)
+            mesh = _voxel_decimate(mesh, target_faces=max_facenum)
+            mesh = _voxel_decimate(mesh, target_faces=max_facenum)
         else:
             # Placeholder for future GPU QEM
-            mesh = _voxel_decimate(mesh, target_faces=max_facenum, min_ratio=self.target_face_ratio)
+            mesh = _voxel_decimate(mesh, target_faces=max_facenum)
+            mesh = _voxel_decimate(mesh, target_faces=max_facenum)
 
         # 4) Post-checks (degenerate once again after decimation)
         mesh = _remove_degenerate_faces(mesh, eps=self.remove_degenerate_eps)
