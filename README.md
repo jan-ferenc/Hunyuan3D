@@ -15,6 +15,7 @@ pip install -r requirements.txt
 ```
 
 The requirements pin `rembg[gpu]` with `onnxruntime-gpu`, so background removal uses CUDA by default on deployment servers with NVIDIA GPUs.
+DiffDMC via `diso` is also bundled so marching cubes extraction runs on the GPU by default.
 
 ## Launching the API Server
 

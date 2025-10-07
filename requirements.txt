@@ -21,6 +21,7 @@ trimesh
 pymeshlab
 pygltflib
 xatlas
+diso
 #kornia
 #facexlib
 
