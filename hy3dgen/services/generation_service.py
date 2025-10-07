@@ -323,10 +323,7 @@ class GenerationService:
             else:
                 logger.debug('flashVDM initialisation failed using marching cubes; continuing with pipeline defaults.', exc_info=True)
         # Configure default surface extractor once to avoid repeated deprecation warnings during inference.
-        try:
-            self.shape_pipeline.vae.surface_extractor = SurfaceExtractors[self._default_mc_algo]()
-        except Exception:  # pragma: no cover - fallback to diffusers default if configuration fails
-            logger.warning('Unable to configure default surface extractor; continuing with pipeline defaults.', exc_info=True)
+        self._set_surface_extractor(self._default_mc_algo)
         self._compile_shape_pipeline()
         self._apply_shape_channels_last()
 
@@ -360,6 +357,15 @@ class GenerationService:
         image = self.rembg(image)
         return image
 
+    def _set_surface_extractor(self, mc_algo: str) -> None:
+        if mc_algo not in SurfaceExtractors:
+            logger.warning("Unknown mc_algo '%s'; retaining existing surface extractor.", mc_algo)
+            return
+        try:
+            self.shape_pipeline.vae.surface_extractor = SurfaceExtractors[mc_algo]()
+        except Exception:
+            logger.warning("Unable to apply surface extractor '%s'; continuing with previous configuration.", mc_algo, exc_info=True)
+
     def generate_mesh(
         self,
         image: Image.Image,
@@ -377,6 +383,7 @@ class GenerationService:
                 seeded_generator = torch.Generator()
             seeded_generator.manual_seed(settings.seed)
             try:
+                self._set_surface_extractor(mc_algo)
                 meshes = self.shape_pipeline(
                     image=image,
                     num_inference_steps=settings.num_inference_steps,
@@ -384,13 +391,13 @@ class GenerationService:
                     box_v=settings.box_v,
                     octree_resolution=settings.octree_resolution,
                     num_chunks=settings.num_chunks,
-                    mc_algo=mc_algo,
                     generator=seeded_generator,
                     output_type='trimesh',
                 )
             except ImportError as exc:
                 if mc_algo == 'dmc':
                     logger.warning('DiffDMC extraction failed (%s); retrying with marching cubes.', exc)
+                    self._set_surface_extractor('mc')
                     meshes = self.shape_pipeline(
                         image=image,
                         num_inference_steps=settings.num_inference_steps,
@@ -398,7 +405,6 @@ class GenerationService:
                         box_v=settings.box_v,
                         octree_resolution=settings.octree_resolution,
                         num_chunks=settings.num_chunks,
-                        mc_algo='mc',
                         generator=seeded_generator,
                         output_type='trimesh',
                     )
@@ -408,6 +414,7 @@ class GenerationService:
 
         with self._shape_generator_lock:
             try:
+                self._set_surface_extractor(mc_algo)
                 meshes = self.shape_pipeline(
                     image=image,
                     num_inference_steps=settings.num_inference_steps,
@@ -415,13 +422,13 @@ class GenerationService:
                     box_v=settings.box_v,
                     octree_resolution=settings.octree_resolution,
                     num_chunks=settings.num_chunks,
-                    mc_algo=mc_algo,
                     generator=self._shape_generator,
                     output_type='trimesh',
                 )
             except ImportError as exc:
                 if mc_algo == 'dmc':
                     logger.warning('DiffDMC extraction failed (%s); retrying with marching cubes.', exc)
+                    self._set_surface_extractor('mc')
                     meshes = self.shape_pipeline(
                         image=image,
                         num_inference_steps=settings.num_inference_steps,
@@ -429,7 +436,6 @@ class GenerationService:
                         box_v=settings.box_v,
                         octree_resolution=settings.octree_resolution,
                         num_chunks=settings.num_chunks,
-                        mc_algo='mc',
                         generator=self._shape_generator,
                         output_type='trimesh',
                     )

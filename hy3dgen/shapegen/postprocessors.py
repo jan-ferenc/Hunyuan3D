@@ -12,9 +12,10 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import logging
 import os
 import tempfile
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import pymeshlab
@@ -23,6 +24,21 @@ import trimesh
 
 from .models.autoencoders import Latent2MeshOutput
 from .utils import synchronize_timer
+
+logger = logging.getLogger(__name__)
+
+try:
+    from .gpu_postprocessors import GPUMeshProcessor
+
+    _GPU_POSTPROCESSOR: Optional[GPUMeshProcessor]
+    try:
+        _GPU_POSTPROCESSOR = GPUMeshProcessor()
+    except Exception:  # pragma: no cover - GPU initialisation may fail at runtime
+        logger.debug("Unable to initialise GPUMeshProcessor; falling back to CPU post-processing.", exc_info=True)
+        _GPU_POSTPROCESSOR = None
+except Exception:  # pragma: no cover - module not present or torch unusable
+    _GPU_POSTPROCESSOR = None
+    logger.debug("GPUMeshProcessor unavailable; continuing with CPU mesh post-processing.", exc_info=True)
 
 
 def load_mesh(path):
@@ -34,7 +50,31 @@ def load_mesh(path):
     return mesh
 
 
+def _use_gpu_postprocessor() -> bool:
+    return _GPU_POSTPROCESSOR is not None and getattr(_GPU_POSTPROCESSOR, "device", None) is not None \
+        and _GPU_POSTPROCESSOR.device.type == "cuda"
+
+
+def _gpu_reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int):
+    assert _GPU_POSTPROCESSOR is not None
+    tm_in = pymeshlab2trimesh(mesh)
+    tm_out = _GPU_POSTPROCESSOR.reduce_face(tm_in, max_facenum=max_facenum)
+    return trimesh2pymeshlab(tm_out)
+
+
+def _gpu_remove_floater(mesh: pymeshlab.MeshSet):
+    assert _GPU_POSTPROCESSOR is not None
+    tm_in = pymeshlab2trimesh(mesh)
+    tm_out = _GPU_POSTPROCESSOR.remove_floater(tm_in)
+    return trimesh2pymeshlab(tm_out)
+
+
 def reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int = 200000):
+    if _use_gpu_postprocessor():
+        try:
+            return _gpu_reduce_face(mesh, max_facenum=max_facenum)
+        except Exception:
+            logger.warning("GPU face reduction failed; reverting to PyMeshLab fallback.", exc_info=True)
     if max_facenum > mesh.current_mesh().face_number():
         return mesh
 
@@ -52,6 +92,11 @@ def reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int = 200000):
 
 
 def remove_floater(mesh: pymeshlab.MeshSet):
+    if _use_gpu_postprocessor():
+        try:
+            return _gpu_remove_floater(mesh)
+        except Exception:
+            logger.warning("GPU floater removal failed; reverting to PyMeshLab fallback.", exc_info=True)
     mesh.apply_filter("compute_selection_by_small_disconnected_components_per_face",
                       nbfaceratio=0.005)
     mesh.apply_filter("compute_selection_transfer_face_to_vertex", inclusive=False)
