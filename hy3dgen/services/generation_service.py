@@ -324,7 +324,17 @@ class GenerationService:
                 logger.debug('flashVDM initialisation failed using marching cubes; continuing with pipeline defaults.', exc_info=True)
         # Configure default surface extractor once to avoid repeated deprecation warnings during inference.
         try:
-            self.shape_pipeline.vae.surface_extractor = SurfaceExtractors[self._default_mc_algo]()
+            self._set_surface_extractor(self._default_mc_algo)
+        except (ImportError, ValueError):  # pragma: no cover - gracefully degrade if DiffDMC unavailable
+            if self._default_mc_algo != 'mc':
+                logger.warning('DiffDMC surface extractor unavailable; defaulting to marching cubes.', exc_info=True)
+                self._default_mc_algo = 'mc'
+                try:
+                    self._set_surface_extractor(self._default_mc_algo)
+                except Exception:
+                    logger.warning('Unable to configure marching cubes surface extractor; continuing with pipeline defaults.', exc_info=True)
+            else:
+                logger.warning('Unable to configure default surface extractor; continuing with pipeline defaults.', exc_info=True)
         except Exception:  # pragma: no cover - fallback to diffusers default if configuration fails
             logger.warning('Unable to configure default surface extractor; continuing with pipeline defaults.', exc_info=True)
         self._compile_shape_pipeline()
@@ -355,6 +365,32 @@ class GenerationService:
 
         self._warmup_pipelines()
 
+    def _set_surface_extractor(self, mc_algo: str) -> None:
+        if mc_algo not in SurfaceExtractors:
+            raise ValueError(f'Unknown surface extraction algorithm "{mc_algo}"')
+        target_cls = SurfaceExtractors[mc_algo]
+        current = getattr(self.shape_pipeline.vae, 'surface_extractor', None)
+        if isinstance(current, target_cls):
+            return
+        self.shape_pipeline.vae.surface_extractor = target_cls()
+
+    def _ensure_surface_extractor(self, requested_algo: str) -> str:
+        try:
+            self._set_surface_extractor(requested_algo)
+            return requested_algo
+        except (ImportError, ValueError) as exc:
+            if requested_algo == 'mc':
+                raise
+            logger.warning(
+                'Surface extractor "%s" unavailable (%s); falling back to marching cubes.',
+                requested_algo,
+                exc,
+            )
+            self._set_surface_extractor('mc')
+            if requested_algo == self._default_mc_algo:
+                self._default_mc_algo = 'mc'
+            return 'mc'
+
     def prepare_image(self, payload: ImagePayload) -> Image.Image:
         image = payload.as_pil_rgba()
         image = self.rembg(image)
@@ -370,6 +406,40 @@ class GenerationService:
         if mc_algo == 'dmc' and self._default_mc_algo != 'dmc':
             logger.warning('DiffDMC surface extraction requested but unavailable; falling back to marching cubes.')
             mc_algo = 'mc'
+
+        def _invoke_pipeline(generator: torch.Generator) -> list[list[trimesh.Trimesh]]:
+            active_algo = self._ensure_surface_extractor(mc_algo)
+            if settings.mc_algo is None and active_algo != mc_algo:
+                self._default_mc_algo = active_algo
+            try:
+                return self.shape_pipeline(
+                    image=image,
+                    num_inference_steps=settings.num_inference_steps,
+                    guidance_scale=settings.guidance_scale,
+                    box_v=settings.box_v,
+                    octree_resolution=settings.octree_resolution,
+                    num_chunks=settings.num_chunks,
+                    generator=generator,
+                    output_type='trimesh',
+                )
+            except ImportError as exc:
+                if active_algo == 'mc':
+                    raise
+                logger.warning('DiffDMC extraction failed (%s); retrying with marching cubes.', exc)
+                fallback_algo = self._ensure_surface_extractor('mc')
+                if settings.mc_algo is None:
+                    self._default_mc_algo = fallback_algo
+                return self.shape_pipeline(
+                    image=image,
+                    num_inference_steps=settings.num_inference_steps,
+                    guidance_scale=settings.guidance_scale,
+                    box_v=settings.box_v,
+                    octree_resolution=settings.octree_resolution,
+                    num_chunks=settings.num_chunks,
+                    generator=generator,
+                    output_type='trimesh',
+                )
+
         if settings.seed is not None:
             try:
                 seeded_generator = torch.Generator(device=gen_device)
@@ -377,62 +447,24 @@ class GenerationService:
                 seeded_generator = torch.Generator()
             seeded_generator.manual_seed(settings.seed)
             try:
-                meshes = self.shape_pipeline(
-                    image=image,
-                    num_inference_steps=settings.num_inference_steps,
-                    guidance_scale=settings.guidance_scale,
-                    box_v=settings.box_v,
-                    octree_resolution=settings.octree_resolution,
-                    num_chunks=settings.num_chunks,
-                    mc_algo=mc_algo,
-                    generator=seeded_generator,
-                    output_type='trimesh',
-                )
+                meshes = _invoke_pipeline(seeded_generator)
             except ImportError as exc:
-                if mc_algo == 'dmc':
-                    logger.warning('DiffDMC extraction failed (%s); retrying with marching cubes.', exc)
-                    meshes = self.shape_pipeline(
-                        image=image,
-                        num_inference_steps=settings.num_inference_steps,
-                        guidance_scale=settings.guidance_scale,
-                        box_v=settings.box_v,
-                        octree_resolution=settings.octree_resolution,
-                        num_chunks=settings.num_chunks,
-                        mc_algo='mc',
-                        generator=seeded_generator,
-                        output_type='trimesh',
-                    )
+                if mc_algo != 'mc':
+                    logger.warning('Surface extraction configuration failed (%s); retrying with marching cubes.', exc)
+                    mc_algo = 'mc'
+                    meshes = _invoke_pipeline(seeded_generator)
                 else:
                     raise
             return meshes[0]
 
         with self._shape_generator_lock:
             try:
-                meshes = self.shape_pipeline(
-                    image=image,
-                    num_inference_steps=settings.num_inference_steps,
-                    guidance_scale=settings.guidance_scale,
-                    box_v=settings.box_v,
-                    octree_resolution=settings.octree_resolution,
-                    num_chunks=settings.num_chunks,
-                    mc_algo=mc_algo,
-                    generator=self._shape_generator,
-                    output_type='trimesh',
-                )
+                meshes = _invoke_pipeline(self._shape_generator)
             except ImportError as exc:
-                if mc_algo == 'dmc':
-                    logger.warning('DiffDMC extraction failed (%s); retrying with marching cubes.', exc)
-                    meshes = self.shape_pipeline(
-                        image=image,
-                        num_inference_steps=settings.num_inference_steps,
-                        guidance_scale=settings.guidance_scale,
-                        box_v=settings.box_v,
-                        octree_resolution=settings.octree_resolution,
-                        num_chunks=settings.num_chunks,
-                        mc_algo='mc',
-                        generator=self._shape_generator,
-                        output_type='trimesh',
-                    )
+                if mc_algo != 'mc':
+                    logger.warning('Surface extraction configuration failed (%s); retrying with marching cubes.', exc)
+                    mc_algo = 'mc'
+                    meshes = _invoke_pipeline(self._shape_generator)
                 else:
                     raise
         return meshes[0]
