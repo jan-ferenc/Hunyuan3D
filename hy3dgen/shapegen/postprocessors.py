@@ -34,59 +34,6 @@ def load_mesh(path):
     return mesh
 
 
-def _use_gpu_postprocessor() -> bool:
-    return _GPU_POSTPROCESSOR is not None and getattr(_GPU_POSTPROCESSOR, "device", None) is not None \
-        and _GPU_POSTPROCESSOR.device.type == "cuda"
-
-
-def _gpu_reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int):
-    assert _GPU_POSTPROCESSOR is not None
-    tm_in = pymeshlab2trimesh(mesh)
-    tm_out = _GPU_POSTPROCESSOR.reduce_face(tm_in, max_facenum=max_facenum)
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-    faces_arr_out = getattr(tm_out, "faces", None)
-    faces_arr_in = getattr(tm_in, "faces", None)
-    faces_out = int(faces_arr_out.shape[0]) if faces_arr_out is not None else 0
-    faces_in = int(faces_arr_in.shape[0]) if faces_arr_in is not None else 0
-    logger.debug(
-        "GPU face reduction result: input_faces=%s target=%s output_faces=%s",
-        faces_in, max_facenum, faces_out,
-    )
-=======
-    faces_out = len(getattr(tm_out, "faces", []) or [])
-    faces_in = len(getattr(tm_in, "faces", []) or [])
-<<<<<<< ours
->>>>>>> theirs
-    target_ratio = getattr(_GPU_POSTPROCESSOR, "target_face_ratio", 0.8)
-    min_expected = max(100, int(max_facenum * max(0.5, target_ratio - 0.1)))
-=======
-    faces_out = len(getattr(tm_out, "faces", []) or [])
-    faces_in = len(getattr(tm_in, "faces", []) or [])
-    min_expected = max(100, int(max_facenum * 0.75))
->>>>>>> theirs
-=======
-    min_expected = max(100, int(max_facenum * 0.75))
->>>>>>> theirs
-    if faces_in >= min_expected and faces_out < min_expected:
-        logger.warning(
-            "GPU face reduction produced only %s faces (target=%s, input=%s); falling back to CPU decimation.",
-            faces_out, max_facenum, faces_in,
-        )
-        raise RuntimeError("GPU face reduction below expected threshold")
-=======
->>>>>>> theirs
-    return trimesh2pymeshlab(tm_out)
-
-
-def _gpu_remove_floater(mesh: pymeshlab.MeshSet):
-    assert _GPU_POSTPROCESSOR is not None
-    tm_in = pymeshlab2trimesh(mesh)
-    tm_out = _GPU_POSTPROCESSOR.remove_floater(tm_in)
-    return trimesh2pymeshlab(tm_out)
-
-
 def reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int = 200000):
     if max_facenum > mesh.current_mesh().face_number():
         return mesh
