@@ -1,7 +1,5 @@
 # Hunyuan3D Local API Server
 
-This repository packages a thin HTTP API around the Hunyuan3D generators so you can serve text-to-3D, image-to-3D, and texture workflows from your own machine. The focus of this guide is to help you stand up the development server quickly.
-
 ## Requirements
 
 - Python 3.10+
@@ -41,4 +39,4 @@ You should receive a JSON response confirming the service is ready.
 
 - Review `api_server.py` to explore the available routes and expected payloads.
 - Consult `hy3dgen/services/imagen_client.py` for examples of how requests are assembled inside the project.
-- Integrate the API with your own client or automation once the health check passes.
+

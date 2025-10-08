@@ -1334,26 +1334,25 @@ class MeshRender():
             """
             device = U0.device
             C = U0.shape[1]
-            known_f = known_mask.float()
+            known_f = known_mask.to(dtype=torch.float32)
             k4_scalar = torch.zeros((1, 1, 3, 3), device=device, dtype=torch.float32)
             k4_scalar[0, 0, 1, 0] = 1.0
             k4_scalar[0, 0, 0, 1] = 1.0
             k4_scalar[0, 0, 1, 2] = 1.0
             k4_scalar[0, 0, 2, 1] = 1.0
-            cnt4 = F.conv2d(F.pad(known_f, (1, 1, 1, 1), mode="replicate"), k4_scalar)
+            cnt4 = F.conv2d(known_f, k4_scalar, padding=1)
             ring = (~known_mask) & (cnt4 > 0)
             if not ring.any():
                 return torch.zeros_like(cnt4), torch.zeros_like(U0)
             U_known = U0 * known_f
             k4_channels = k4_scalar.repeat(C, 1, 3, 3)
-            sum4 = F.conv2d(
-                F.pad(U_known, (1, 1, 1, 1), mode="replicate"),
-                k4_channels,
-                groups=C,
-            )
-            t = sum4 / cnt4.clamp(min=1e-6)
-            w = (cnt4 / 4.0) * float(scale)
-            w = w * ring.float()
+            sum4 = F.conv2d(U_known, k4_channels, padding=1, groups=C)
+            denom = cnt4.clamp(min=1e-6)
+            t = sum4 / denom
+            ring_f = ring.to(dtype=torch.float32)
+            t = t * ring_f
+            w = (denom / 4.0) * float(scale)
+            w = w * ring_f
             return w, t
 
         def _gpu_inpaint_poisson(
@@ -1483,8 +1482,11 @@ class MeshRender():
             known_mask = (~unknown_mask).contiguous()
             seam_w, seam_t = _build_boundary_ring_constraints(U0, known_mask, scale=lambda_ring)
             ring_has = bool(seam_w is not None and seam_w.gt(0).any().item())
+            if not ring_has:
+                seam_w = None
+                seam_t = None
             stats["ring_constraints"] = ring_has
-            stats["ring_pixels"] = int((seam_w > 0).sum().item()) if seam_w is not None else 0
+            stats["ring_pixels"] = int(seam_w.gt(0).sum().item()) if ring_has else 0
             stats["seam_constraints"] = False
             if lambda_seam > 0.0:
                 try:
