@@ -49,11 +49,44 @@ if not _GPU_INPAINT_PATCH_LOADED:
 
 class Hunyuan3DTexGenConfig:
 
-    def __init__(self, light_remover_ckpt_path, multiview_ckpt_path, subfolder_name, torch_dtype=torch.float16):
-        self.device = 'cuda'
+    def __init__(
+        self,
+        light_remover_ckpt_path,
+        multiview_ckpt_path,
+        subfolder_name,
+        torch_dtype=torch.float16,
+        device=None,
+    ):
+        device_pref = device
+        if device_pref is None:
+            env_device = os.environ.get('HY3DGEN_DEVICE', '').strip()
+            device_pref = env_device or None
+        if device_pref is None or str(device_pref).strip().lower() == 'auto':
+            device_pref = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device_str = str(device_pref).strip()
+        if device_str.startswith('cuda') and not torch.cuda.is_available():
+            logger.info("Requested CUDA device '%s' but CUDA is unavailable; falling back to CPU.", device_str)
+            device_str = 'cpu'
+        try:
+            torch.device(device_str)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError(f"Invalid device specification: {device_pref!r}") from exc
+
+        self.device = device_str
         self.light_remover_ckpt_path = light_remover_ckpt_path
         self.multiview_ckpt_path = multiview_ckpt_path
-        self.torch_dtype = torch_dtype
+
+        if torch_dtype is None:
+            resolved_dtype = torch.float16 if self.device.startswith('cuda') else torch.float32
+        elif self.device.startswith('cuda'):
+            resolved_dtype = torch_dtype
+        else:
+            if torch_dtype == torch.float16:
+                logger.info("Using float32 dtype because float16 is unsupported on CPU.")
+                resolved_dtype = torch.float32
+            else:
+                resolved_dtype = torch_dtype
+        self.torch_dtype = resolved_dtype
 
         self.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
         self.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
@@ -70,7 +103,13 @@ class Hunyuan3DTexGenConfig:
 
 class Hunyuan3DPaintPipeline:
     @classmethod
-    def from_pretrained(cls, model_path, subfolder='hunyuan3d-paint-v2-0-turbo', torch_dtype=torch.float16):
+    def from_pretrained(
+        cls,
+        model_path,
+        subfolder='hunyuan3d-paint-v2-0-turbo',
+        torch_dtype=torch.float16,
+        device=None,
+    ):
         original_model_path = model_path
         if not os.path.exists(model_path):
             # try local path
@@ -105,31 +144,52 @@ class Hunyuan3DPaintPipeline:
                     cls._ensure_safetensors(model_path, subfolder)
                     delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
                     multiview_model_path = os.path.join(model_path, subfolder)
-                    return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder, torch_dtype=torch_dtype))
+                    return cls(Hunyuan3DTexGenConfig(
+                        delight_model_path,
+                        multiview_model_path,
+                        subfolder,
+                        torch_dtype=torch_dtype,
+                        device=device,
+                    ))
                 except Exception:
                     import traceback
                     traceback.print_exc()
                     raise RuntimeError(f"Something wrong while loading {model_path}")
             else:
-                return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder, torch_dtype=torch_dtype))
+                return cls(Hunyuan3DTexGenConfig(
+                    delight_model_path,
+                    multiview_model_path,
+                    subfolder,
+                    torch_dtype=torch_dtype,
+                    device=device,
+                ))
         else:
             delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
             multiview_model_path = os.path.join(model_path, subfolder)
             cls._ensure_safetensors(model_path, subfolder)
-            return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder, torch_dtype=torch_dtype))
+            return cls(Hunyuan3DTexGenConfig(
+                delight_model_path,
+                multiview_model_path,
+                subfolder,
+                torch_dtype=torch_dtype,
+                device=device,
+            ))
 
     def __init__(self, config):
         self.config = config
         self.models = {}
         self.render = MeshRender(
             default_resolution=self.config.render_size,
-            texture_size=self.config.texture_size)
+            texture_size=self.config.texture_size,
+            device=self.config.device,
+        )
 
         self.load_models()
 
     def load_models(self):
         # empty cude cache
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # Load model
         self.models['delight_model'] = Light_Shadow_Remover(self.config)
         self.models['multiview_model'] = Multiview_Diffusion_Net(self.config)

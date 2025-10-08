@@ -199,7 +199,7 @@ class Light_Shadow_Remover():
                 return cached
 
         if image.mode == 'RGBA':
-            image_array = np.array(image, copy=True)
+            image_array = np.asarray(image)
             alpha_channel = image_array[:, :, 3]
             erosion_size = 3
             kernel = np.ones((erosion_size, erosion_size), np.uint8)
@@ -207,13 +207,11 @@ class Light_Shadow_Remover():
             image_array[alpha_channel == 0, :3] = 255
             image_array[:, :, 3] = alpha_channel
             image = Image.fromarray(image_array)
-            image_tensor = torch.from_numpy(image_array).to(device=self.device, dtype=torch.float32) / 255.0
+            image_tensor = torch.from_numpy(np.asarray(image)).to(device=self.device, dtype=torch.float32) / 255.0
             alpha = image_tensor[:, :, 3:]
             rgb_target = image_tensor[:, :, :3]
         else:
-            image_array = np.array(image, copy=True)
-            image = Image.fromarray(image_array)
-            image_tensor = torch.from_numpy(image_array).to(device=self.device, dtype=torch.float32) / 255.0
+            image_tensor = torch.from_numpy(np.asarray(image)).to(device=self.device, dtype=torch.float32) / 255.0
             alpha = torch.ones_like(image_tensor)[:, :, :1]
             rgb_target = image_tensor[:, :, :3]
 

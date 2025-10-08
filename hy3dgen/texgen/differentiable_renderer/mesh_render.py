@@ -134,7 +134,7 @@ class MeshRender():
         use_antialias=True, max_mip_level=None, filter_mode='linear',
         bake_mode='linear', raster_mode='cr', device='cuda'):
 
-        self.device = device
+        self.device = self._resolve_device(device)
 
         self.set_default_render_resolution(default_resolution)
         self.set_default_texture_resolution(texture_size)
@@ -180,6 +180,18 @@ class MeshRender():
         self._mesh_hash = None
         self._seam_cache = {}
         self._vertex_cache = {}
+
+    def _resolve_device(self, device_spec):
+        if device_spec is None:
+            device_spec = 'cuda' if torch.cuda.is_available() else 'cpu'
+        try:
+            resolved = torch.device(device_spec)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError(f"Unsupported device specification: {device_spec!r}") from exc
+        if resolved.type == 'cuda' and not torch.cuda.is_available():
+            logger.info("MeshRender requested CUDA device '%s' but CUDA is unavailable; switching to CPU.", device_spec)
+            resolved = torch.device('cpu')
+        return resolved
 
     def raster_rasterize(self, pos, tri, resolution, ranges=None, grad_db=True):
 
@@ -575,7 +587,7 @@ class MeshRender():
         return self.tex.cpu().numpy()
 
     def to(self, device):
-        self.device = device
+        self.device = self._resolve_device(device)
 
         for attr_name in dir(self):
             attr_value = getattr(self, attr_name)
