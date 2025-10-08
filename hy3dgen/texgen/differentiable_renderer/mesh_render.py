@@ -1334,6 +1334,15 @@ class MeshRender():
             """
             device = U0.device
             C = U0.shape[1]
+            # Ensure spatial shapes match; crop to common region if needed
+            Hu, Wu = int(U0.shape[-2]), int(U0.shape[-1])
+            Hm, Wm = int(known_mask.shape[-2]), int(known_mask.shape[-1])
+            H = Hu if Hu <= Hm else Hm
+            W = Wu if Wu <= Wm else Wm
+            if (Hu != H) or (Wu != W):
+                U0 = U0[..., :H, :W]
+            if (Hm != H) or (Wm != W):
+                known_mask = known_mask[..., :H, :W]
             known_f = known_mask.to(dtype=torch.float32)
             k4_scalar = torch.zeros((1, 1, 3, 3), device=device, dtype=torch.float32)
             k4_scalar[0, 0, 1, 0] = 1.0
