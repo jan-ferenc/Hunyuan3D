@@ -38,6 +38,17 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
+# Ensure GPU inpainting defaults are active without needing shell exports.
+_DEFAULT_INPAINT_ENV = {
+    "HY3DGEN_GPU_INPAINT": "1",
+    "HY3DGEN_INPAINT_METHOD": "auto",
+    "HY3DGEN_INPAINT_PRECISION": "fp16",
+    "HY3DGEN_INPAINT_USE_GRAPHS": "1",
+    "HY3DGEN_GPU_VERTEX_INPAINT": "auto",
+}
+for _env_key, _env_value in _DEFAULT_INPAINT_ENV.items():
+    os.environ.setdefault(_env_key, _env_value)
+
 from hy3dgen.services.generation_service import (
     GenerationService,
     ShapeGenerationSettings,

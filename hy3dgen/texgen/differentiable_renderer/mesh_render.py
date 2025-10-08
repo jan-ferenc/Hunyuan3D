@@ -1056,11 +1056,18 @@ class MeshRender():
             if target_device.type == "cuda" and not torch.cuda.is_available():
                 target_device = torch.device("cpu")
         info["input_is_tensor"] = bool(texture_is_tensor)
-        skip_vertex = os.getenv("HY3DGEN_SKIP_VERTEX_INPAINT", "0") == "1"
-        gpu_vertex = os.getenv("HY3DGEN_GPU_VERTEX_INPAINT", "0") == "1"
+        skip_vertex_env = os.getenv("HY3DGEN_SKIP_VERTEX_INPAINT", "0")
+        skip_vertex = skip_vertex_env == "1"
+        gpu_vertex_env = os.getenv("HY3DGEN_GPU_VERTEX_INPAINT", "auto").lower()
+        if gpu_vertex_env not in {"0", "1", "auto", "true", "false"}:
+            gpu_vertex_env = "auto"
+        gpu_vertex_flag = (
+            gpu_vertex_env in {"1", "true"}
+            or (gpu_vertex_env == "auto" and torch.cuda.is_available())
+        )
         ops_device = target_device if (isinstance(target_device, torch.device) and target_device.type == "cuda") else torch.device("cpu")
         info["vertex_skip"] = skip_vertex
-        info["vertex_gpu_enabled"] = gpu_vertex
+        info["vertex_gpu_env"] = gpu_vertex_env
         info["ops_device"] = str(ops_device)
         self._last_uv_inpaint_info = info
         if debug_logs_enabled:
@@ -1459,8 +1466,14 @@ class MeshRender():
 
         # Gather mesh info and apply vertex-space inpaint prep
         mesh_cache = None
-        vertex_mode = "skip" if skip_vertex else ("gpu" if (gpu_vertex and torch.cuda.is_available()) else "cpu")
+        if skip_vertex:
+            vertex_mode = "skip"
+        elif gpu_vertex_flag:
+            vertex_mode = "gpu"
+        else:
+            vertex_mode = "cpu"
         info["vertex_mode"] = vertex_mode
+        info["vertex_gpu_active"] = vertex_mode == "gpu"
         if vertex_mode == "cpu":
             vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
             mesh_cache = (vtx_pos, pos_idx, vtx_uv, uv_idx)
