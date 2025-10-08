@@ -1245,7 +1245,17 @@ class MeshRender():
                 U = torch.where(unknown_mask, Ub, U0)
             return U
 
-        def _build_seam_constraint_maps(U0, vtx_pos, pos_idx, vtx_uv, uv_idx, H, W, lambda_seam=1.0):
+        def _build_seam_constraint_maps(
+            U0,
+            vtx_pos,
+            pos_idx,
+            vtx_uv,
+            uv_idx,
+            H,
+            W,
+            lambda_seam=1.0,
+            known_mask=None,
+        ):
             """
             Build seam weight/target maps by tying UV duplicates of the same 3D vertex.
             Returns seam_w:[1,1,H,W], seam_t:[1,C,H,W] float32 (device of U0) and cache stats.
@@ -1264,25 +1274,59 @@ class MeshRender():
             if ys.numel() == 0 or num_groups == 0:
                 return seam_w, seam_t, cache_info
 
+            if known_mask is not None:
+                if known_mask.dim() == 4:
+                    known_hw = known_mask[0, 0]
+                elif known_mask.dim() == 3:
+                    known_hw = known_mask[0]
+                    if known_hw.dim() == 3:
+                        known_hw = known_hw[0]
+                else:
+                    known_hw = known_mask
+                known_hw = known_hw.to(device=device)
+                valid = known_hw[ys, xs]
+            else:
+                valid = torch.ones_like(ys, dtype=torch.bool, device=device)
+
+            if not valid.any():
+                cache_info["seam_valid_texels"] = 0
+                return seam_w, seam_t, cache_info
+
+            ys = ys[valid]
+            xs = xs[valid]
+            group_ids = group_ids[valid]
+            cache_info["seam_valid_texels"] = int(ys.numel())
+
             seam_w[0, 0, ys, xs] = float(lambda_seam)
-            colors = U0[0, :, ys, xs].permute(1, 0)  # [N,C]
 
-            seam_color_sum = torch.zeros((num_groups, C), device=device, dtype=torch.float32)
-            seam_color_sum.index_add_(0, group_ids, colors)
-            counts = torch.clamp(group_counts, min=1e-6).unsqueeze(-1)
-            seam_mean = seam_color_sum / counts
+            unique_groups = torch.unique(group_ids)
+            for gid in unique_groups.tolist():
+                idx = group_ids == gid
+                if not idx.any():
+                    continue
+                ys_sel = ys[idx]
+                xs_sel = xs[idx]
+                colors = U0[0, :, ys_sel, xs_sel]  # [C,K]
+                if colors.shape[1] > 1:
+                    group_stat = colors.median(dim=1, keepdim=True).values
+                else:
+                    group_stat = colors.mean(dim=1, keepdim=True)
+                seam_t[0, :, ys_sel, xs_sel] = group_stat
 
-            seam_t_vals = seam_mean[group_ids].permute(1, 0)
-            seam_t[0, :, ys, xs] = seam_t_vals
-
-            ones3 = cache["kernel"]
-            w_d = F.conv2d(F.pad(seam_w, (1, 1, 1, 1), mode="replicate"), ones3)
-            num = F.conv2d(F.pad(seam_w * seam_t.sum(1, keepdim=True), (1, 1, 1, 1), mode="replicate"), ones3)
+            ones3_scalar = cache["kernel"]
+            ones3_channels = torch.ones((C, 1, 3, 3), device=device, dtype=torch.float32)
+            w_d = F.conv2d(F.pad(seam_w, (1, 1, 1, 1), mode="replicate"), ones3_scalar)
             w_d = torch.clamp(w_d, min=1e-6)
-            t_avg = num / w_d
-            seam_t = t_avg.repeat(1, C, 1, 1).clamp_(0.0, 1.0)
-            seam_w = w_d.clamp_max_(lambda_seam * 9.0)
-            return seam_w, seam_t, cache_info
+            seam_w_broadcast = seam_w.repeat(1, C, 1, 1)
+            num = F.conv2d(
+                F.pad(seam_w_broadcast * seam_t, (1, 1, 1, 1), mode="replicate"),
+                ones3_channels,
+                groups=C,
+            )
+            t_avg = num / w_d.repeat(1, C, 1, 1)
+            seam_t = t_avg.clamp_(0.0, 1.0)
+            seam_w = F.conv2d(F.pad(seam_w, (1, 1, 1, 1), mode="replicate"), ones3_scalar)
+            return seam_w.clamp_max_(lambda_seam * 9.0), seam_t, cache_info
 
         def _gpu_inpaint_poisson(
             U0,
@@ -1381,6 +1425,13 @@ class MeshRender():
             U0 = _to_tensor_image(device, texture_np)  # [1,C,H,W], [0,1]
             H, W = U0.shape[-2], U0.shape[-1]
             unknown_mask = torch.from_numpy((mask_np == 0).astype(np.bool_)).to(device).view(1, 1, H, W)
+            mask_dilate = int(os.getenv("HY3DGEN_INPAINT_MASK_DILATE", "1"))
+            stats["mask_dilate"] = mask_dilate
+            if mask_dilate > 0:
+                um = unknown_mask.float()
+                for _ in range(mask_dilate):
+                    um = (F.max_pool2d(um, kernel_size=3, stride=1, padding=1) > 0).float()
+                unknown_mask = um.bool()
 
             use_amp = os.getenv("HY3DGEN_INPAINT_PRECISION", "fp16").lower() == "fp16"
             use_graphs = os.getenv("HY3DGEN_INPAINT_USE_GRAPHS", "1") == "1"
@@ -1402,9 +1453,20 @@ class MeshRender():
             # Optional seam constraints
             seam_w, seam_t = None, None
             try:
+                known_mask = (~unknown_mask).contiguous()
                 seam_w, seam_t, seam_cache_info = _build_seam_constraint_maps(
-                    U0, vtx_pos, pos_idx, vtx_uv, uv_idx, H, W, lambda_seam=lambda_seam
+                    U0,
+                    vtx_pos,
+                    pos_idx,
+                    vtx_uv,
+                    uv_idx,
+                    H,
+                    W,
+                    lambda_seam=lambda_seam,
+                    known_mask=known_mask,
                 )
+                border_ring = unknown_mask & (F.max_pool2d(known_mask.float(), 3, stride=1, padding=1) > 0)
+                seam_w = seam_w * border_ring.float()
                 stats["seam_constraints"] = seam_w is not None and seam_t is not None
                 stats.update(seam_cache_info)
             except Exception as e:
