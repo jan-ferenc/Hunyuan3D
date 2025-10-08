@@ -1430,6 +1430,81 @@ class MeshRender():
             w = w * ring_f
             return w.to(torch.float32), t.to(torch.float32)
 
+        def _normalize_seam_constraint_maps(seam_w, seam_t, H, W, C, device, log_fn):
+            """Coerce seam tensors to [1,1,H,W] / [1,C,H,W] float32 on `device`."""
+            if seam_w is None or seam_t is None:
+                return None, None
+
+            def _coerce_weight(weight):
+                if weight is None:
+                    return None
+                if not isinstance(weight, torch.Tensor):
+                    raise TypeError("seam weight must be torch.Tensor or None")
+                wt = weight.to(device=device, dtype=torch.float32)
+                if wt.dim() == 2:
+                    wt = wt.unsqueeze(0).unsqueeze(0)
+                elif wt.dim() == 3:
+                    wt = wt.unsqueeze(0) if wt.shape[0] == 1 else wt.unsqueeze(1)
+                if wt.dim() != 4:
+                    raise ValueError(f"seam weight must be 2D-4D, got shape {tuple(weight.shape)}")
+                if wt.shape[0] != 1 or wt.shape[1] != 1:
+                    log_fn(
+                        "seam weight trimming to single batch/channel: shape=%s target_hw=(%d,%d)",
+                        tuple(int(x) for x in wt.shape),
+                        H,
+                        W,
+                    )
+                    wt = wt[:1, :1]
+                if wt.shape[-2:] != (H, W):
+                    log_fn(
+                        "seam weight resizing from %s to (H=%d,W=%d)",
+                        tuple(int(x) for x in wt.shape[-2:]),
+                        H,
+                        W,
+                    )
+                    wt = F.interpolate(wt, size=(H, W), mode="nearest")
+                return wt.contiguous()
+
+            def _coerce_target(target):
+                if target is None:
+                    return None
+                if not isinstance(target, torch.Tensor):
+                    raise TypeError("seam target must be torch.Tensor or None")
+                tt = target.to(device=device, dtype=torch.float32)
+                if tt.dim() == 3:
+                    tt = tt.unsqueeze(0)
+                if tt.dim() != 4:
+                    raise ValueError(f"seam target must be 3D/4D, got shape {tuple(target.shape)}")
+                if tt.shape[0] != 1:
+                    log_fn("seam target trimming batch dim from %s", tuple(int(x) for x in tt.shape))
+                    tt = tt[:1]
+                if tt.shape[1] != C:
+                    if tt.shape[1] == 1 and C != 1:
+                        log_fn(
+                            "seam target expanding channels from 1 to %d using repeat.",
+                            C,
+                        )
+                        tt = tt.repeat(1, C, 1, 1)
+                    elif tt.shape[1] != C:
+                        raise ValueError(
+                            f"seam target channel mismatch; expected {C}, got {tt.shape[1]}"
+                        )
+                if tt.shape[-2:] != (H, W):
+                    log_fn(
+                        "seam target resizing from %s to (H=%d,W=%d)",
+                        tuple(int(x) for x in tt.shape[-2:]),
+                        H,
+                        W,
+                    )
+                    tt = F.interpolate(tt, size=(H, W), mode="nearest")
+                return tt.contiguous()
+
+            seam_w_norm = _coerce_weight(seam_w)
+            seam_t_norm = _coerce_target(seam_t)
+            if seam_w_norm is None or seam_t_norm is None or not seam_w_norm.any():
+                return None, None
+            return seam_w_norm, seam_t_norm
+
         def _gpu_inpaint_poisson(
             U0,
             unknown_mask,
@@ -1468,7 +1543,10 @@ class MeshRender():
                 return torch.where(unknown_mask, Urelax, U0)
 
             if device.type == "cuda" and use_graph:
-                key = graph_key or (tuple(U0.shape), bool(seam_w is not None))
+                key = graph_key or (
+                    tuple(U0.shape),
+                    None if seam_w is None else tuple(int(x) for x in seam_w.shape),
+                )
                 ctx = self._inpaint_graphs.get(key)
                 if ctx is None:
                     static = {
@@ -1562,11 +1640,6 @@ class MeshRender():
             known_mask = (~unknown_mask).contiguous()
             seam_w, seam_t = _build_boundary_ring_constraints(U0, known_mask, scale=lambda_ring)
             ring_has = bool(seam_w is not None and seam_w.gt(0).any().item())
-            if not ring_has:
-                seam_w = None
-                seam_t = None
-            stats["ring_constraints"] = ring_has
-            stats["ring_pixels"] = int(seam_w.gt(0).sum().item()) if ring_has else 0
             stats["seam_constraints"] = False
             if lambda_seam > 0.0:
                 try:
@@ -1594,6 +1667,32 @@ class MeshRender():
                     log_debug("UV seam group build failed; continuing without. %s", e, exc_info=True)
                     stats["seam_error"] = str(e)
 
+            seam_w, seam_t = _normalize_seam_constraint_maps(
+                seam_w,
+                seam_t,
+                H,
+                W,
+                U0.shape[1],
+                device,
+                log_debug,
+            )
+            if seam_w is None or seam_t is None:
+                seam_w = None
+                seam_t = None
+                ring_has = False
+
+            stats["ring_constraints"] = ring_has
+            stats["ring_pixels"] = int(seam_w.gt(0).sum().item()) if seam_w is not None else 0
+            stats["seam_w_shape"] = tuple(int(x) for x in seam_w.shape) if seam_w is not None else None
+            stats["seam_t_shape"] = tuple(int(x) for x in seam_t.shape) if seam_t is not None else None
+            if seam_w is not None:
+                log_debug(
+                    "uv_inpaint: seam tensors normalized to seam_w=%s seam_t=%s unknown_mask=%s",
+                    tuple(int(x) for x in seam_w.shape),
+                    tuple(int(x) for x in seam_t.shape),
+                    tuple(int(x) for x in unknown_mask.shape),
+                )
+
             def _run_poisson(U_init):
                 t0 = time.perf_counter()
                 U = _gpu_inpaint_poisson(
@@ -1606,7 +1705,11 @@ class MeshRender():
                     seam_t=seam_t,
                     use_amp=use_amp,
                     use_graph=use_graphs,
-                    graph_key=("poisson", tuple(U_init.shape), seam_w is not None),
+                    graph_key=(
+                        "poisson",
+                        tuple(U_init.shape),
+                        None if seam_w is None else tuple(int(x) for x in seam_w.shape),
+                    ),
                 )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
