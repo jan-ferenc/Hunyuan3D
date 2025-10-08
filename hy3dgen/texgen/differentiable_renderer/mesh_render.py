@@ -1426,7 +1426,6 @@ class MeshRender():
             H, W = U0.shape[-2], U0.shape[-1]
             unknown_mask = torch.from_numpy((mask_np == 0).astype(np.bool_)).to(device).view(1, 1, H, W)
             mask_dilate = int(os.getenv("HY3DGEN_INPAINT_MASK_DILATE", "1"))
-            stats["mask_dilate"] = mask_dilate
             if mask_dilate > 0:
                 um = unknown_mask.float()
                 for _ in range(mask_dilate):
@@ -1449,6 +1448,7 @@ class MeshRender():
                 "prefill_runs": 0,
                 "poisson_runs": 0,
             }
+            stats["mask_dilate"] = mask_dilate
 
             # Optional seam constraints
             seam_w, seam_t = None, None
