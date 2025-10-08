@@ -1328,6 +1328,34 @@ class MeshRender():
             seam_w = F.conv2d(F.pad(seam_w, (1, 1, 1, 1), mode="replicate"), ones3_scalar)
             return seam_w.clamp_max_(lambda_seam * 9.0), seam_t, cache_info
 
+        def _build_boundary_ring_constraints(U0, known_mask, scale=1.5):
+            """
+            Build weights/targets for the 1px unknown ring adjacent to known texels.
+            """
+            device = U0.device
+            C = U0.shape[1]
+            known_f = known_mask.float()
+            k4_scalar = torch.zeros((1, 1, 3, 3), device=device, dtype=torch.float32)
+            k4_scalar[0, 0, 1, 0] = 1.0
+            k4_scalar[0, 0, 0, 1] = 1.0
+            k4_scalar[0, 0, 1, 2] = 1.0
+            k4_scalar[0, 0, 2, 1] = 1.0
+            cnt4 = F.conv2d(F.pad(known_f, (1, 1, 1, 1), mode="replicate"), k4_scalar)
+            ring = (~known_mask) & (cnt4 > 0)
+            if not ring.any():
+                return torch.zeros_like(cnt4), torch.zeros_like(U0)
+            U_known = U0 * known_f
+            k4_channels = k4_scalar.repeat(C, 1, 3, 3)
+            sum4 = F.conv2d(
+                F.pad(U_known, (1, 1, 1, 1), mode="replicate"),
+                k4_channels,
+                groups=C,
+            )
+            t = sum4 / cnt4.clamp(min=1e-6)
+            w = (cnt4 / 4.0) * float(scale)
+            w = w * ring.float()
+            return w, t
+
         def _gpu_inpaint_poisson(
             U0,
             unknown_mask,
@@ -1435,12 +1463,14 @@ class MeshRender():
             use_amp = os.getenv("HY3DGEN_INPAINT_PRECISION", "fp16").lower() == "fp16"
             use_graphs = os.getenv("HY3DGEN_INPAINT_USE_GRAPHS", "1") == "1"
             lambda_seam = float(os.getenv("HY3DGEN_INPAINT_SEAM_LAMBDA", "1.0"))
+            lambda_ring = float(os.getenv("HY3DGEN_INPAINT_RING_LAMBDA", "1.5"))
             area_frac = float(unknown_mask.float().mean().item())
             stats = {
                 "device": str(device),
                 "use_amp": use_amp,
                 "use_graphs": use_graphs,
                 "lambda_seam": lambda_seam,
+                "lambda_ring": lambda_ring,
                 "area_frac": area_frac,
                 "method": method_choice,
                 "prefill_ms": 0.0,
@@ -1450,29 +1480,37 @@ class MeshRender():
             }
             stats["mask_dilate"] = mask_dilate
 
-            # Optional seam constraints
-            seam_w, seam_t = None, None
-            try:
-                known_mask = (~unknown_mask).contiguous()
-                seam_w, seam_t, seam_cache_info = _build_seam_constraint_maps(
-                    U0,
-                    vtx_pos,
-                    pos_idx,
-                    vtx_uv,
-                    uv_idx,
-                    H,
-                    W,
-                    lambda_seam=lambda_seam,
-                    known_mask=known_mask,
-                )
-                border_ring = unknown_mask & (F.max_pool2d(known_mask.float(), 3, stride=1, padding=1) > 0)
-                seam_w = seam_w * border_ring.float()
-                stats["seam_constraints"] = seam_w is not None and seam_t is not None
-                stats.update(seam_cache_info)
-            except Exception as e:
-                log_debug("Seam constraint build failed; continuing without. %s", e, exc_info=True)
-                stats["seam_error"] = str(e)
-                stats["seam_constraints"] = False
+            known_mask = (~unknown_mask).contiguous()
+            seam_w, seam_t = _build_boundary_ring_constraints(U0, known_mask, scale=lambda_ring)
+            ring_has = bool(seam_w is not None and seam_w.gt(0).any().item())
+            stats["ring_constraints"] = ring_has
+            stats["ring_pixels"] = int((seam_w > 0).sum().item()) if seam_w is not None else 0
+            stats["seam_constraints"] = False
+            if lambda_seam > 0.0:
+                try:
+                    seam_w_uv, seam_t_uv, seam_cache_info = _build_seam_constraint_maps(
+                        U0,
+                        vtx_pos,
+                        pos_idx,
+                        vtx_uv,
+                        uv_idx,
+                        H,
+                        W,
+                        lambda_seam=lambda_seam,
+                        known_mask=known_mask,
+                    )
+                    if seam_w is None:
+                        seam_w = seam_w_uv
+                        seam_t = seam_t_uv
+                    else:
+                        w_sum = seam_w + seam_w_uv + 1e-6
+                        seam_t = (seam_t * seam_w + seam_t_uv * seam_w_uv) / w_sum
+                        seam_w = w_sum
+                    stats["seam_constraints"] = bool(seam_w_uv is not None and seam_w_uv.gt(0).any().item())
+                    stats.update(seam_cache_info)
+                except Exception as e:
+                    log_debug("UV seam group build failed; continuing without. %s", e, exc_info=True)
+                    stats["seam_error"] = str(e)
 
             def _run_poisson(U_init):
                 t0 = time.perf_counter()
