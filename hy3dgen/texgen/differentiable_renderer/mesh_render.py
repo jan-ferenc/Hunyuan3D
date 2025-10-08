@@ -1348,7 +1348,8 @@ class MeshRender():
             k4_channels = k4_scalar.repeat(C, 1, 3, 3)
             sum4 = F.conv2d(U_known, k4_channels, padding=1, groups=C)
             denom = cnt4.clamp(min=1e-6)
-            t = sum4 / denom
+            denom_broadcast = denom.repeat(1, C, 1, 1)
+            t = sum4 / denom_broadcast
             ring_f = ring.to(dtype=torch.float32)
             t = t * ring_f
             w = (denom / 4.0) * float(scale)
