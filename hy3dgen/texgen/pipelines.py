@@ -31,13 +31,20 @@ else:
 
 
 from .differentiable_renderer.mesh_render import MeshRender
-from .differentiable_renderer import mesh_render_gpu_inpaint_patch  # noqa: F401  # Apply GPU inpainting patch
+try:
+    from .differentiable_renderer import mesh_render_gpu_inpaint_patch  # noqa: F401  # Apply GPU inpainting patch
+    _GPU_INPAINT_PATCH_LOADED = True
+except ImportError:
+    mesh_render_gpu_inpaint_patch = None  # type: ignore
+    _GPU_INPAINT_PATCH_LOADED = False
 from .utils.dehighlight_utils import Light_Shadow_Remover
 from .utils.multiview_utils import Multiview_Diffusion_Net
 from .utils.imagesuper_utils import Image_Super_Net
 from .utils.uv_warp_utils import mesh_uv_wrap
 
 logger = logging.getLogger(__name__)
+if not _GPU_INPAINT_PATCH_LOADED:
+    logger.debug("mesh_render_gpu_inpaint_patch module not found; GPU patch import skipped.")
 
 
 class Hunyuan3DTexGenConfig:
@@ -195,11 +202,20 @@ class Hunyuan3DPaintPipeline:
         return texture, ori_trust_map > 1E-8
 
     def texture_inpaint(self, texture, mask):
-
-        texture_np = self.render.uv_inpaint(texture, mask)
-        texture = torch.tensor(texture_np / 255).float().to(texture.device)
-
-        return texture
+        """
+        Inpaint using renderer UV path. Returns a torch tensor on the original device in [0,1].
+        Keeps data on-GPU when available and avoids redundant copies.
+        """
+        out_np = self.render.uv_inpaint(texture, mask)  # uint8 [H,W,C]
+        if os.getenv("HY3DGEN_INPAINT_DEBUG", "0") == "1":
+            info = getattr(self.render, "_last_uv_inpaint_info", None)
+            if info is not None:
+                logger.info("texture_inpaint: uv_inpaint stats %s", info)
+        if isinstance(texture, torch.Tensor):
+            dev = texture.device
+        else:
+            dev = torch.device(self.config.device)
+        return torch.from_numpy(out_np).to(dev, non_blocking=True).float() / 255.0
 
     def recenter_image(self, image, border_ratio=0.2):
         if image.mode == 'RGB':

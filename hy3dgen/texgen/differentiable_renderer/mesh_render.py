@@ -816,6 +816,27 @@ class MeshRender():
         falling back to OpenCV Telea on CPU. Returns numpy uint8 [H,W,C].
         `mask` is uint8 where 255 indicates known texels and 0 indicates holes.
         """
+        env_gpu_flag = os.getenv("HY3DGEN_GPU_INPAINT", "1")
+        method_choice = os.getenv("HY3DGEN_INPAINT_METHOD", "auto").lower()
+        debug_logs_enabled = os.getenv("HY3DGEN_INPAINT_DEBUG", "0") == "1"
+        log_debug = logger.info if debug_logs_enabled else logger.debug
+        info = {
+            "input_type": type(texture).__name__,
+            "mask_input_type": type(mask).__name__,
+            "cuda_available": torch.cuda.is_available(),
+            "env_gpu": env_gpu_flag,
+            "env_method": method_choice,
+        }
+        self._last_uv_inpaint_info = info
+        if debug_logs_enabled:
+            logger.info(
+                "uv_inpaint: start input_type=%s mask_type=%s env_gpu=%s method=%s cuda_available=%s",
+                info["input_type"],
+                info["mask_input_type"],
+                env_gpu_flag,
+                method_choice,
+                info["cuda_available"],
+            )
 
         # -------- helpers (nested to minimize file-wide churn) ----------------
         def _to_tensor_image(device, x):
@@ -1066,11 +1087,22 @@ class MeshRender():
             H, W = U0.shape[-2], U0.shape[-1]
             unknown_mask = torch.from_numpy((mask_np == 0).astype(np.bool_)).to(device).view(1, 1, H, W)
 
-            method_env = os.getenv("HY3DGEN_INPAINT_METHOD", "auto").lower()
             use_amp = os.getenv("HY3DGEN_INPAINT_PRECISION", "fp16").lower() == "fp16"
             use_graphs = os.getenv("HY3DGEN_INPAINT_USE_GRAPHS", "1") == "1"
             lambda_seam = float(os.getenv("HY3DGEN_INPAINT_SEAM_LAMBDA", "1.0"))
             area_frac = float(unknown_mask.float().mean().item())
+            stats = {
+                "device": str(device),
+                "use_amp": use_amp,
+                "use_graphs": use_graphs,
+                "lambda_seam": lambda_seam,
+                "area_frac": area_frac,
+                "method": method_choice,
+                "prefill_ms": 0.0,
+                "poisson_ms": 0.0,
+                "prefill_runs": 0,
+                "poisson_runs": 0,
+            }
 
             # Optional seam constraints
             seam_w, seam_t = None, None
@@ -1078,8 +1110,11 @@ class MeshRender():
                 seam_w, seam_t = _build_seam_constraint_maps(
                     U0, vtx_pos, pos_idx, vtx_uv, uv_idx, H, W, lambda_seam=lambda_seam
                 )
+                stats["seam_constraints"] = seam_w is not None and seam_t is not None
             except Exception as e:
-                logger.debug("Seam constraint build failed; continuing without. %s", e, exc_info=True)
+                log_debug("Seam constraint build failed; continuing without. %s", e, exc_info=True)
+                stats["seam_error"] = str(e)
+                stats["seam_constraints"] = False
 
             def _run_poisson(U_init):
                 t0 = time.perf_counter()
@@ -1097,7 +1132,10 @@ class MeshRender():
                 )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                logger.debug("GPU Poisson inpaint: %.3f ms", (time.perf_counter() - t0) * 1000.0)
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                stats["poisson_ms"] += elapsed
+                stats["poisson_runs"] += 1
+                log_debug("GPU Poisson inpaint: %.3f ms", elapsed)
                 return U
 
             def _run_diffusion(U_init, iters=12):
@@ -1107,32 +1145,39 @@ class MeshRender():
                 )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                logger.debug("GPU diffusion prefill: %.3f ms", (time.perf_counter() - t0) * 1000.0)
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                stats["prefill_ms"] += elapsed
+                stats["prefill_runs"] += 1
+                log_debug("GPU diffusion prefill: %.3f ms", elapsed)
                 return U
 
-            if method_env == "cpu":
-                logger.debug("HY3DGEN_INPAINT_METHOD=cpu, skipping GPU path.")
-                return None
+            if method_choice == "cpu":
+                log_debug("HY3DGEN_INPAINT_METHOD=cpu, skipping GPU path.")
+                stats["skip_reason"] = "method=cpu"
+                return None, stats
 
-            if method_env == "diffusion" or (method_env == "auto" and area_frac < 0.05):
+            if method_choice == "diffusion" or (method_choice == "auto" and area_frac < 0.05):
                 U_prefill = _run_diffusion(U0, iters=int(os.getenv("HY3DGEN_DIFF_ITERS", "12")))
-                U = _run_poisson(U_prefill) if method_env == "auto" else U_prefill
-            elif method_env == "poisson" or method_env == "auto":
-                if method_env == "auto" and area_frac < 0.20:
+                stats["strategy"] = "diffusion" if method_choice == "diffusion" else "auto:diffusion+poisson"
+                U = _run_poisson(U_prefill) if method_choice == "auto" else U_prefill
+            elif method_choice == "poisson" or method_choice == "auto":
+                if method_choice == "auto" and area_frac < 0.20:
                     U_prefill = _run_diffusion(U0, iters=6)
                     U = _run_poisson(U_prefill)
+                    stats["strategy"] = "auto:prefill+poisson"
                 else:
                     U = _run_poisson(U0)
+                    stats["strategy"] = "poisson"
             else:
                 U = _run_poisson(U0)
+                stats["strategy"] = "poisson-default"
 
             out = _from_tensor_image(U)
-            logger.debug(
-                "GPU inpaint total: %.3f ms (area=%.2f%%)",
-                (time.perf_counter() - start_all) * 1000.0,
-                area_frac * 100.0,
-            )
-            return out
+            total_ms = (time.perf_counter() - start_all) * 1000.0
+            stats["total_ms"] = total_ms
+            log_debug("GPU inpaint total: %.3f ms (area=%.2f%%)", total_ms, area_frac * 100.0)
+            stats["path"] = "gpu"
+            return out, stats
 
         # -------- end helpers -----------------------------------------------
 
@@ -1153,25 +1198,48 @@ class MeshRender():
         # Gather mesh info and apply existing vertex-space inpaint prep
         vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
         texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+        info["texture_shape"] = list(texture_np.shape)
+        if mask.size:
+            info["mask_hole_frac"] = float(np.count_nonzero(mask == 0)) / float(mask.size)
+        else:
+            info["mask_hole_frac"] = 0.0
 
         # Try GPU path first
-        use_gpu = (os.getenv("HY3DGEN_GPU_INPAINT", "1") == "1") and torch.cuda.is_available()
-        method_env = os.getenv("HY3DGEN_INPAINT_METHOD", "auto").lower()
-        if use_gpu and method_env != "cpu":
+        use_gpu = (env_gpu_flag == "1") and torch.cuda.is_available()
+        info["gpu_requested"] = env_gpu_flag == "1"
+        info["gpu_attempted"] = bool(use_gpu and method_choice != "cpu")
+        if debug_logs_enabled and not info["gpu_attempted"]:
+            logger.info(
+                "uv_inpaint: skipping GPU path (use_gpu_flag=%s cuda_available=%s method=%s)",
+                env_gpu_flag,
+                torch.cuda.is_available(),
+                method_choice,
+            )
+        if use_gpu and method_choice != "cpu":
             try:
                 start_gpu = time.perf_counter()
-                out_np = _gpu_inpaint_auto(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+                out_np, stats = _gpu_inpaint_auto(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+                info.update(stats)
                 if out_np is None:
-                    raise RuntimeError("GPU inpaint skipped by method=cpu")
+                    raise RuntimeError(f"GPU inpaint skipped: {stats.get('skip_reason', 'unknown reason')}")
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                logger.debug("uv_inpaint: GPU path completed in %.3f ms", (time.perf_counter() - start_gpu) * 1000.0)
+                gpu_elapsed = (time.perf_counter() - start_gpu) * 1000.0
+                info["mode"] = "gpu"
+                info.setdefault("total_ms", gpu_elapsed)
+                log_debug("uv_inpaint: GPU path completed in %.3f ms", gpu_elapsed)
+                self._last_uv_inpaint_info = info
                 return out_np
             except Exception as e:
+                info["fallback_reason"] = str(e)
                 logger.exception("GPU inpaint failed; falling back to CPU Telea. Reason: %s", e)
 
         # CPU Telea fallback
         start_cpu = time.perf_counter()
         out_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_TELEA)
-        logger.debug("uv_inpaint: CPU Telea completed in %.3f ms", (time.perf_counter() - start_cpu) * 1000.0)
+        cpu_elapsed = (time.perf_counter() - start_cpu) * 1000.0
+        info["mode"] = "cpu"
+        info["cpu_duration_ms"] = cpu_elapsed
+        self._last_uv_inpaint_info = info
+        log_debug("uv_inpaint: CPU Telea completed in %.3f ms", cpu_elapsed)
         return out_np
