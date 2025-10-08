@@ -1330,40 +1330,37 @@ class MeshRender():
 
         def _build_boundary_ring_constraints(U0, known_mask, scale=1.5):
             """
-            Build weights/targets for the 1px unknown ring adjacent to known texels.
+            Robust, shape-stable boundary constraint builder.
+            Guarantees intermediates are exactly [H,W].
             """
             device = U0.device
-            C = U0.shape[1]
-            # Ensure spatial shapes match; crop to common region if needed
-            Hu, Wu = int(U0.shape[-2]), int(U0.shape[-1])
-            Hm, Wm = int(known_mask.shape[-2]), int(known_mask.shape[-1])
-            H = Hu if Hu <= Hm else Hm
-            W = Wu if Wu <= Wm else Wm
-            if (Hu != H) or (Wu != W):
-                U0 = U0[..., :H, :W]
-            if (Hm != H) or (Wm != W):
-                known_mask = known_mask[..., :H, :W]
-            known_f = known_mask.to(dtype=torch.float32)
-            k4_scalar = torch.zeros((1, 1, 3, 3), device=device, dtype=torch.float32)
-            k4_scalar[0, 0, 1, 0] = 1.0
-            k4_scalar[0, 0, 0, 1] = 1.0
-            k4_scalar[0, 0, 1, 2] = 1.0
-            k4_scalar[0, 0, 2, 1] = 1.0
-            cnt4 = F.conv2d(known_f, k4_scalar, padding=1)
-            ring = (~known_mask) & (cnt4 > 0)
+            _, C, H, W = U0.shape
+            # Ensure known_mask matches U0 spatial size via nearest interpolation
+            if known_mask.shape[-2:] != (H, W):
+                km = known_mask.float()
+                km = F.interpolate(km, size=(H, W), mode='nearest')
+                known_mask = km.bool()
+            known_f = known_mask.float()  # [1,1,H,W]
+
+            # 4-neighbor kernel
+            k4_scalar = torch.tensor([[[[0., 1., 0.],
+                                        [1., 0., 1.],
+                                        [0., 1., 0.]]]], device=device, dtype=torch.float32)
+            cnt4 = F.conv2d(known_f, k4_scalar, padding=1)  # [1,1,H,W]
+            ring = (~known_mask) & (cnt4 > 0)              # [1,1,H,W]
             if not ring.any():
                 return torch.zeros_like(cnt4), torch.zeros_like(U0)
+
             U_known = U0 * known_f
             k4_channels = k4_scalar.repeat(C, 1, 3, 3)
-            sum4 = F.conv2d(U_known, k4_channels, padding=1, groups=C)
-            denom = cnt4.clamp(min=1e-6)
-            denom_broadcast = denom.repeat(1, C, 1, 1)
-            t = sum4 / denom_broadcast
+            sum4 = F.conv2d(U_known, k4_channels, padding=1, groups=C)  # [1,C,H,W]
+            denom = cnt4.clamp(min=1e-6)                                  # [1,1,H,W]
+            t = sum4 / denom                                               # [1,C,H,W]
             ring_f = ring.to(dtype=torch.float32)
             t = t * ring_f
             w = (denom / 4.0) * float(scale)
             w = w * ring_f
-            return w, t
+            return w.to(torch.float32), t.to(torch.float32)
 
         def _gpu_inpaint_poisson(
             U0,
@@ -1461,7 +1458,12 @@ class MeshRender():
 
             U0 = _to_tensor_image(device, texture_np)  # [1,C,H,W], [0,1]
             H, W = U0.shape[-2], U0.shape[-1]
-            unknown_mask = torch.from_numpy((mask_np == 0).astype(np.bool_)).to(device).view(1, 1, H, W)
+            # Robust mask construction: always coerce to HxW to avoid size mismatches
+            mh, mw = mask_np.shape[:2]
+            m = torch.from_numpy((mask_np == 0).astype(np.uint8)).to(device).view(1, 1, mh, mw).float()
+            if (mh, mw) != (H, W):
+                m = F.interpolate(m, size=(H, W), mode='nearest')
+            unknown_mask = m.bool()  # True where we must inpaint
             mask_dilate = int(os.getenv("HY3DGEN_INPAINT_MASK_DILATE", "1"))
             if mask_dilate > 0:
                 um = unknown_mask.float()
