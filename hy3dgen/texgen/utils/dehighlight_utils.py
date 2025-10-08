@@ -200,6 +200,8 @@ class Light_Shadow_Remover():
 
         if image.mode == 'RGBA':
             image_array = np.asarray(image)
+            if not image_array.flags.writeable:
+                image_array = np.array(image_array, copy=True)
             alpha_channel = image_array[:, :, 3]
             erosion_size = 3
             kernel = np.ones((erosion_size, erosion_size), np.uint8)
@@ -207,11 +209,17 @@ class Light_Shadow_Remover():
             image_array[alpha_channel == 0, :3] = 255
             image_array[:, :, 3] = alpha_channel
             image = Image.fromarray(image_array)
-            image_tensor = torch.from_numpy(np.asarray(image)).to(device=self.device, dtype=torch.float32) / 255.0
+            tensor_source = np.asarray(image)
+            if not tensor_source.flags.writeable:
+                tensor_source = np.array(tensor_source, copy=True)
+            image_tensor = torch.from_numpy(tensor_source).to(device=self.device, dtype=torch.float32) / 255.0
             alpha = image_tensor[:, :, 3:]
             rgb_target = image_tensor[:, :, :3]
         else:
-            image_tensor = torch.from_numpy(np.asarray(image)).to(device=self.device, dtype=torch.float32) / 255.0
+            tensor_source = np.asarray(image)
+            if not tensor_source.flags.writeable:
+                tensor_source = np.array(tensor_source, copy=True)
+            image_tensor = torch.from_numpy(tensor_source).to(device=self.device, dtype=torch.float32) / 255.0
             alpha = torch.ones_like(image_tensor)[:, :, :1]
             rgb_target = image_tensor[:, :, :3]
 
@@ -232,7 +240,10 @@ class Light_Shadow_Remover():
                 guidance_scale=self.cfg_text,
             ).images[0]
 
-        image_tensor = torch.from_numpy(np.asarray(image)).to(device=self.device, dtype=torch.float32) / 255.0
+        tensor_source = np.asarray(image)
+        if not tensor_source.flags.writeable:
+            tensor_source = np.array(tensor_source, copy=True)
+        image_tensor = torch.from_numpy(tensor_source).to(device=self.device, dtype=torch.float32) / 255.0
         rgb_src = image_tensor[:,:,:3]
         image = self.recorrect_rgb(rgb_src, rgb_target, alpha)
         image = image[:,:,:3]*image[:,:,3:] + torch.ones_like(image[:,:,:3])*(1.0-image[:,:,3:])
