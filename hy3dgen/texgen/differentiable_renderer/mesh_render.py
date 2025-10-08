@@ -1354,12 +1354,30 @@ class MeshRender():
                 raise ValueError(f"known_mask must be 2D-4D, got shape {tuple(mask.shape)}")
 
             if mask.shape[0] != 1:
+                log_debug(
+                    "boundary ring trimming extra batch dimension: mask_shape=%s target_hw=(%d,%d)",
+                    tuple(int(x) for x in mask.shape),
+                    H,
+                    W,
+                )
                 mask = mask[:1]
             if mask.shape[1] != 1:
+                log_debug(
+                    "boundary ring trimming extra channel dimension: mask_shape=%s target_hw=(%d,%d)",
+                    tuple(int(x) for x in mask.shape),
+                    H,
+                    W,
+                )
                 mask = mask[:, :1]
 
             mask_f = mask.float()
             if mask_f.shape[-2:] != (H, W):
+                log_debug(
+                    "boundary ring resizing mask from %s to (H=%d,W=%d)",
+                    tuple(int(x) for x in mask_f.shape[-2:]),
+                    H,
+                    W,
+                )
                 mask_f = F.interpolate(mask_f, size=(H, W), mode="nearest")
             known_mask = mask_f.gt(0.5).contiguous()
             known_f = known_mask.float()  # [1,1,H,W]
@@ -1369,7 +1387,25 @@ class MeshRender():
                                         [1.0, 0.0, 1.0],
                                         [0.0, 1.0, 0.0]]]], device=device, dtype=torch.float32)
             cnt4 = F.conv2d(known_f, k4_scalar, padding=1)  # [1,1,H,W]
-            ring = (~known_mask) & (cnt4 > 0)  # [1,1,H,W]
+            ring = (~known_mask) & (cnt4 > 0)
+            if ring.dim() == 2:
+                ring = ring.unsqueeze(0).unsqueeze(0)
+            elif ring.dim() == 3:
+                ring = ring.unsqueeze(0)
+            if ring.dim() != 4:
+                raise RuntimeError(
+                    f"boundary ring unexpected dim {ring.dim()} (expected 4) "
+                    f"known_mask_shape={tuple(int(x) for x in known_mask.shape)} "
+                    f"cnt4_shape={tuple(int(x) for x in cnt4.shape)}"
+                )
+            if ring.shape[-2:] != (H, W):
+                log_debug(
+                    "boundary ring resizing ring from %s to (H=%d,W=%d)",
+                    tuple(int(x) for x in ring.shape[-2:]),
+                    H,
+                    W,
+                )
+                ring = F.interpolate(ring.float(), size=(H, W), mode="nearest") > 0.5
             if not ring.any():
                 return torch.zeros_like(cnt4), torch.zeros_like(U0)
 
@@ -1381,6 +1417,14 @@ class MeshRender():
                 denom = F.interpolate(denom, size=sum4.shape[-2:], mode="nearest")
             t = sum4 / denom  # [1,C,H,W]
             ring_f = ring.to(dtype=torch.float32)
+            if ring_f.shape[-2:] != t.shape[-2:]:
+                log_debug(
+                    "boundary ring resizing ring_f from %s to %s",
+                    tuple(int(x) for x in ring_f.shape[-2:]),
+                    tuple(int(x) for x in t.shape[-2:]),
+                )
+                ring_f = F.interpolate(ring_f, size=t.shape[-2:], mode="nearest")
+                ring = ring_f > 0.5
             t = t * ring_f
             w = (denom / 4.0) * float(scale)
             w = w * ring_f
