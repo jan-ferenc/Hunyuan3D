@@ -12,9 +12,11 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import hashlib
 import logging
 import os
 import time
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -175,6 +177,10 @@ class MeshRender():
         else:
             raise f'No camera type {camera_type}'
 
+        self._mesh_hash = None
+        self._seam_cache = {}
+        self._vertex_cache = {}
+
     def raster_rasterize(self, pos, tri, resolution, ranges=None, grad_db=True):
 
         if self.raster_mode == 'cr':
@@ -272,6 +278,9 @@ class MeshRender():
             self.vtx_pos = (self.vtx_pos - center) * \
                            (scale_factor / float(scale))
             self.scale_factor = scale_factor
+        self._mesh_hash = None
+        self._seam_cache.clear()
+        self._vertex_cache.clear()
 
     def set_texture(self, tex):
         if isinstance(tex, np.ndarray):
@@ -307,6 +316,214 @@ class MeshRender():
 
         vtx_uv[:, 1] = 1.0 - vtx_uv[:, 1]
         return vtx_pos, pos_idx, vtx_uv, uv_idx
+
+    def _mesh_cache_key(self):
+        if self._mesh_hash is None:
+            hasher = hashlib.sha1()
+            for tensor in (self.vtx_pos, self.vtx_uv, self.pos_idx, self.uv_idx):
+                arr = tensor.detach().cpu().numpy()
+                hasher.update(arr.tobytes())
+            self._mesh_hash = hasher.hexdigest()
+        return self._mesh_hash
+
+    def _get_vertex_cache(self, tex_h, tex_w, device):
+        if not hasattr(self, "_vertex_cache"):
+            self._vertex_cache = {}
+        mesh_key = (self._mesh_cache_key(), int(tex_h), int(tex_w))
+        entry = self._vertex_cache.get(mesh_key)
+        base_created = False
+        if entry is None:
+            uv_cpu = self.vtx_uv.detach().cpu()
+            uv_idx_cpu = self.uv_idx.detach().cpu().view(-1).long()
+            pos_idx_cpu = self.pos_idx.detach().cpu().view(-1).long()
+            xs_cpu = torch.clamp((uv_cpu[:, 0] * (tex_w - 1)).round().long(), 0, tex_w - 1)
+            ys_cpu = torch.clamp(((1.0 - uv_cpu[:, 1]) * (tex_h - 1)).round().long(), 0, tex_h - 1)
+            entry = {
+                "uv_x_cpu": xs_cpu,
+                "uv_y_cpu": ys_cpu,
+                "uv_idx_flat_cpu": uv_idx_cpu,
+                "pos_idx_flat_cpu": pos_idx_cpu,
+                "num_uv": int(uv_cpu.shape[0]),
+                "num_vertices": int(self.vtx_pos.shape[0]),
+                "device_cache": {},
+            }
+            self._vertex_cache[mesh_key] = entry
+            base_created = True
+        device_key = (device.type, device.index if device.index is not None else -1)
+        cache = entry["device_cache"].get(device_key)
+        device_created = False
+        if cache is None:
+            cache = {
+                "uv_x": entry["uv_x_cpu"].to(device=device, non_blocking=True),
+                "uv_y": entry["uv_y_cpu"].to(device=device, non_blocking=True),
+                "uv_idx_flat": entry["uv_idx_flat_cpu"].to(device=device, non_blocking=True),
+                "pos_idx_flat": entry["pos_idx_flat_cpu"].to(device=device, non_blocking=True),
+            }
+            entry["device_cache"][device_key] = cache
+            device_created = True
+        cache_info = {
+            "vertex_cache_base_created": base_created,
+            "vertex_cache_device_created": device_created,
+        }
+        return cache, entry, cache_info
+
+    def _get_seam_lookup(self, tex_h, tex_w, device, mesh_cache=None):
+        if not hasattr(self, "_seam_cache"):
+            self._seam_cache = {}
+        mesh_key = (self._mesh_cache_key(), int(tex_h), int(tex_w))
+        entry = self._seam_cache.get(mesh_key)
+        base_created = False
+        if entry is None:
+            if mesh_cache is None:
+                mesh_cache = self.get_mesh()
+            vtx_pos, pos_idx, vtx_uv, uv_idx = mesh_cache
+            pos_to_uvs = defaultdict(set)
+            tri_count = pos_idx.shape[0]
+            for f in range(tri_count):
+                for k in range(3):
+                    pos_to_uvs[int(pos_idx[f, k])].add(int(uv_idx[f, k]))
+            tex_h_m1 = tex_h - 1
+            tex_w_m1 = tex_w - 1
+            group_coords = []
+            for uv_indices in pos_to_uvs.values():
+                if len(uv_indices) <= 1:
+                    continue
+                coords = []
+                for uidx in uv_indices:
+                    x = int(np.clip(round(vtx_uv[uidx, 0] * tex_w_m1), 0, tex_w_m1))
+                    y = int(np.clip(round(vtx_uv[uidx, 1] * tex_h_m1), 0, tex_h_m1))
+                    coords.append((y, x))
+                coords = list(dict.fromkeys(coords))
+                if len(coords) > 1:
+                    group_coords.append(coords)
+            y_list, x_list, group_ids = [], [], []
+            for gid, coords in enumerate(group_coords):
+                for (y, x) in coords:
+                    y_list.append(y)
+                    x_list.append(x)
+                    group_ids.append(gid)
+            if len(group_ids) > 0:
+                group_ids_cpu = torch.tensor(group_ids, dtype=torch.long)
+                counts_cpu = torch.bincount(group_ids_cpu, minlength=len(group_coords)).to(torch.float32)
+            else:
+                group_ids_cpu = torch.zeros(0, dtype=torch.long)
+                counts_cpu = torch.zeros(0, dtype=torch.float32)
+            entry = {
+                "y_cpu": torch.tensor(y_list, dtype=torch.long),
+                "x_cpu": torch.tensor(x_list, dtype=torch.long),
+                "group_ids_cpu": group_ids_cpu,
+                "group_counts_cpu": counts_cpu,
+                "num_groups": len(group_coords),
+                "device_cache": {},
+            }
+            self._seam_cache[mesh_key] = entry
+            base_created = True
+        device_key = (device.type, device.index if device.index is not None else -1)
+        cache = entry["device_cache"].get(device_key)
+        device_created = False
+        if cache is None:
+            cache = {
+                "y": entry["y_cpu"].to(device=device, non_blocking=True),
+                "x": entry["x_cpu"].to(device=device, non_blocking=True),
+                "group_ids": entry["group_ids_cpu"].to(device=device, non_blocking=True),
+                "group_counts": entry["group_counts_cpu"].to(device=device, non_blocking=True),
+                "kernel": torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32),
+            }
+            entry["device_cache"][device_key] = cache
+            device_created = True
+        cache_info = {
+            "seam_cache_base_created": base_created,
+            "seam_cache_device_created": device_created,
+        }
+        return cache, entry, cache_info
+
+    def _gpu_vertex_inpaint(self, texture_tensor, mask_bool, device):
+        """
+        Perform lightweight vertex-based UV inpaint on the GPU to prefill seam texels.
+        texture_tensor: float32 [H,W,C] on `device`
+        mask_bool: bool [H,W] indicating known texels
+        Returns updated texture tensor, mask bool, and stats dict.
+        """
+        tex_h, tex_w, channels = texture_tensor.shape
+        cache, meta, cache_info = self._get_vertex_cache(tex_h, tex_w, device)
+        uv_x = cache["uv_x"]
+        uv_y = cache["uv_y"]
+        uv_idx_flat = cache["uv_idx_flat"]
+        pos_idx_flat = cache["pos_idx_flat"]
+        num_uv = meta["num_uv"]
+        num_vertices = meta["num_vertices"]
+
+        start = time.perf_counter()
+        known_uv = mask_bool[uv_y, uv_x]  # [num_uv]
+        colors_uv = texture_tensor[uv_y, uv_x, :]  # [num_uv,C]
+        flat_known = known_uv[uv_idx_flat]
+
+        stats = {
+            "vertex_gpu_updates": 0,
+            "vertex_gpu_newfills": 0,
+            "vertex_gpu_time_ms": 0.0,
+        }
+        stats.update(cache_info)
+
+        if not flat_known.any():
+            stats["vertex_gpu_time_ms"] = (time.perf_counter() - start) * 1000.0
+            return texture_tensor, mask_bool, stats
+
+        vertex_counts = torch.zeros(num_vertices, device=device, dtype=torch.float32)
+        vertex_counts.index_add_(0, pos_idx_flat, flat_known.float())
+
+        vertex_color_sum = torch.zeros((num_vertices, channels), device=device, dtype=torch.float32)
+        weighted_colors = colors_uv[uv_idx_flat] * flat_known.float().unsqueeze(-1)
+        vertex_color_sum.index_add_(0, pos_idx_flat, weighted_colors)
+
+        vertex_has = vertex_counts > 0
+        if not vertex_has.any():
+            stats["vertex_gpu_time_ms"] = (time.perf_counter() - start) * 1000.0
+            return texture_tensor, mask_bool, stats
+
+        vertex_avg = torch.zeros_like(vertex_color_sum)
+        vertex_avg[vertex_has] = vertex_color_sum[vertex_has] / torch.clamp(vertex_counts[vertex_has].unsqueeze(-1), min=1e-6)
+
+        valid_vertex = vertex_has[pos_idx_flat]
+        if not valid_vertex.any():
+            stats["vertex_gpu_time_ms"] = (time.perf_counter() - start) * 1000.0
+            return texture_tensor, mask_bool, stats
+
+        uv_counts = torch.zeros(num_uv, device=device, dtype=torch.float32)
+        uv_counts.index_add_(0, uv_idx_flat, valid_vertex.float())
+
+        uv_color_sum = torch.zeros((num_uv, channels), device=device, dtype=torch.float32)
+        uv_color_sum.index_add_(
+            0,
+            uv_idx_flat,
+            vertex_avg[pos_idx_flat] * valid_vertex.float().unsqueeze(-1),
+        )
+
+        uv_has_color = uv_counts > 0
+        if not uv_has_color.any():
+            stats["vertex_gpu_time_ms"] = (time.perf_counter() - start) * 1000.0
+            return texture_tensor, mask_bool, stats
+
+        update_idx = torch.nonzero(uv_has_color, as_tuple=False).squeeze(1)
+        if update_idx.numel() == 0:
+            stats["vertex_gpu_time_ms"] = (time.perf_counter() - start) * 1000.0
+            return texture_tensor, mask_bool, stats
+
+        new_colors = uv_color_sum[update_idx] / torch.clamp(uv_counts[update_idx].unsqueeze(-1), min=1e-6)
+        new_colors = new_colors.clamp_(0.0, 1.0)
+
+        updated_texture = texture_tensor.clone()
+        updated_mask = mask_bool.clone()
+        ys = uv_y[update_idx]
+        xs = uv_x[update_idx]
+        updated_texture[ys, xs, :] = new_colors
+        prev_known = known_uv[update_idx]
+        updated_mask[ys, xs] = True
+
+        stats["vertex_gpu_updates"] = int(update_idx.numel())
+        stats["vertex_gpu_newfills"] = int((~prev_known).sum().item())
+        stats["vertex_gpu_time_ms"] = (time.perf_counter() - start) * 1000.0
+        return updated_texture, updated_mask, stats
 
     def get_texture(self):
         return self.tex.cpu().numpy()
@@ -827,6 +1044,24 @@ class MeshRender():
             "env_gpu": env_gpu_flag,
             "env_method": method_choice,
         }
+        texture_is_tensor = isinstance(texture, torch.Tensor)
+        if texture_is_tensor:
+            target_device = texture.device
+            target_dtype = texture.dtype
+        else:
+            render_device = getattr(self, "device", "cuda")
+            target_device = torch.device(render_device)
+            target_dtype = torch.float32
+        if isinstance(target_device, torch.device):
+            if target_device.type == "cuda" and not torch.cuda.is_available():
+                target_device = torch.device("cpu")
+        info["input_is_tensor"] = bool(texture_is_tensor)
+        skip_vertex = os.getenv("HY3DGEN_SKIP_VERTEX_INPAINT", "0") == "1"
+        gpu_vertex = os.getenv("HY3DGEN_GPU_VERTEX_INPAINT", "0") == "1"
+        ops_device = target_device if (isinstance(target_device, torch.device) and target_device.type == "cuda") else torch.device("cpu")
+        info["vertex_skip"] = skip_vertex
+        info["vertex_gpu_enabled"] = gpu_vertex
+        info["ops_device"] = str(ops_device)
         self._last_uv_inpaint_info = info
         if debug_logs_enabled:
             logger.info(
@@ -875,6 +1110,39 @@ class MeshRender():
                 t = t[0]
             t = t.permute(1, 2, 0).contiguous()
             return (t.cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+
+        def _to_texture_tensor(x, device):
+            """Convert inputs to float32 torch tensor [H,W,C] on `device` in [0,1]."""
+            if isinstance(x, torch.Tensor):
+                t = x.detach()
+                if t.dim() == 4:
+                    if t.shape[0] != 1:
+                        raise ValueError("Unsupported batch dimension for texture tensor")
+                    t = t[0]
+                if t.dim() != 3:
+                    raise ValueError("Unsupported tensor shape for texture tensor conversion")
+                t = t.to(device=device)
+                if t.dtype in (torch.float16, torch.float32, torch.float64):
+                    t = t.to(dtype=torch.float32)
+                else:
+                    t = t.float()
+                max_val = float(t.max().item()) if t.numel() > 0 else 0.0
+                if max_val > 1.0005:
+                    t = t / 255.0
+                return t.clamp_(0.0, 1.0).contiguous()
+            elif isinstance(x, np.ndarray):
+                arr = x.astype(np.float32)
+                if arr.ndim == 2:
+                    arr = arr[..., None]
+                max_val = float(arr.max()) if arr.size > 0 else 0.0
+                if max_val > 1.0:
+                    arr = arr / 255.0
+                t = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+                return t.clamp_(0.0, 1.0).contiguous()
+            elif isinstance(x, Image.Image):
+                return _to_texture_tensor(np.array(x), device)
+            else:
+                raise ValueError("Unsupported texture type for tensor conversion")
 
         def _conv2d_same(x, weight):
             """Grouped conv2d with replicate padding. x:[1,C,H,W], w:[C,1,kh,kw]."""
@@ -925,69 +1193,41 @@ class MeshRender():
         def _build_seam_constraint_maps(U0, vtx_pos, pos_idx, vtx_uv, uv_idx, H, W, lambda_seam=1.0):
             """
             Build seam weight/target maps by tying UV duplicates of the same 3D vertex.
-            Returns seam_w:[1,1,H,W], seam_t:[1,C,H,W] float32 (device of U0).
+            Returns seam_w:[1,1,H,W], seam_t:[1,C,H,W] float32 (device of U0) and cache stats.
             """
-            import numpy as _np
-            from collections import defaultdict
-
-            # Normalize to numpy
-            def _to_np(a):
-                if isinstance(a, torch.Tensor):
-                    return a.detach().cpu().numpy()
-                return a
-
-            pos_idx_np = _to_np(pos_idx)
-            uv_idx_np = _to_np(uv_idx)
-            vtx_uv_np = _to_np(vtx_uv)
-
-            pos_to_uvs = defaultdict(set)
-            tri_count = pos_idx_np.shape[0]
-            for f in range(tri_count):
-                p0, p1, p2 = int(pos_idx_np[f, 0]), int(pos_idx_np[f, 1]), int(pos_idx_np[f, 2])
-                u0, u1, u2 = int(uv_idx_np[f, 0]), int(uv_idx_np[f, 1]), int(uv_idx_np[f, 2])
-                pos_to_uvs[p0].add(u0)
-                pos_to_uvs[p1].add(u1)
-                pos_to_uvs[p2].add(u2)
-
-            groups = []
-            for _, uvs in pos_to_uvs.items():
-                uv_list = list(uvs)
-                if len(uv_list) <= 1:
-                    continue
-                coords = []
-                for u in uv_list:
-                    x = int(_np.clip(round(vtx_uv_np[u, 0] * (W - 1)), 0, W - 1))
-                    y = int(_np.clip(round(vtx_uv_np[u, 1] * (H - 1)), 0, H - 1))
-                    coords.append((y, x))
-                coords = list(dict.fromkeys(coords))
-                if len(coords) <= 1:
-                    continue
-                groups.append(coords)
-
             device = U0.device
+            cache, entry, cache_info = self._get_seam_lookup(H, W, device, (vtx_pos, pos_idx, vtx_uv, uv_idx))
+            ys = cache["y"]
+            xs = cache["x"]
+            group_ids = cache["group_ids"]
+            group_counts = cache["group_counts"]
+            num_groups = entry["num_groups"]
             C = U0.shape[1]
+
             seam_w = torch.zeros((1, 1, H, W), device=device, dtype=torch.float32)
             seam_t = torch.zeros((1, C, H, W), device=device, dtype=torch.float32)
-            if not groups:
-                return seam_w, seam_t
+            if ys.numel() == 0 or num_groups == 0:
+                return seam_w, seam_t, cache_info
 
-            for coords in groups:
-                ys = torch.tensor([y for (y, _) in coords], device=device, dtype=torch.long)
-                xs = torch.tensor([x for (_, x) in coords], device=device, dtype=torch.long)
-                colors = U0[0, :, ys, xs]  # [C,K]
-                group_mean = colors.mean(dim=1, keepdim=True)  # [C,1]
-                seam_t[0, :, ys, xs] = group_mean
-                seam_w[0, 0, ys, xs] = float(lambda_seam)
+            seam_w[0, 0, ys, xs] = float(lambda_seam)
+            colors = U0[0, :, ys, xs].permute(1, 0)  # [N,C]
 
-            # Light dilation/averaging to stabilize
-            ones3 = torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32)
+            seam_color_sum = torch.zeros((num_groups, C), device=device, dtype=torch.float32)
+            seam_color_sum.index_add_(0, group_ids, colors)
+            counts = torch.clamp(group_counts, min=1e-6).unsqueeze(-1)
+            seam_mean = seam_color_sum / counts
+
+            seam_t_vals = seam_mean[group_ids].permute(1, 0)
+            seam_t[0, :, ys, xs] = seam_t_vals
+
+            ones3 = cache["kernel"]
             w_d = F.conv2d(F.pad(seam_w, (1, 1, 1, 1), mode="replicate"), ones3)
             num = F.conv2d(F.pad(seam_w * seam_t.sum(1, keepdim=True), (1, 1, 1, 1), mode="replicate"), ones3)
             w_d = torch.clamp(w_d, min=1e-6)
             t_avg = num / w_d
             seam_t = t_avg.repeat(1, C, 1, 1).clamp_(0.0, 1.0)
             seam_w = w_d.clamp_max_(lambda_seam * 9.0)
-            return seam_w, seam_t
+            return seam_w, seam_t, cache_info
 
         def _gpu_inpaint_poisson(
             U0,
@@ -1107,10 +1347,11 @@ class MeshRender():
             # Optional seam constraints
             seam_w, seam_t = None, None
             try:
-                seam_w, seam_t = _build_seam_constraint_maps(
+                seam_w, seam_t, seam_cache_info = _build_seam_constraint_maps(
                     U0, vtx_pos, pos_idx, vtx_uv, uv_idx, H, W, lambda_seam=lambda_seam
                 )
                 stats["seam_constraints"] = seam_w is not None and seam_t is not None
+                stats.update(seam_cache_info)
             except Exception as e:
                 log_debug("Seam constraint build failed; continuing without. %s", e, exc_info=True)
                 stats["seam_error"] = str(e)
@@ -1172,7 +1413,23 @@ class MeshRender():
                 U = _run_poisson(U0)
                 stats["strategy"] = "poisson-default"
 
-            out = _from_tensor_image(U)
+            if texture_is_tensor:
+                out_tensor = U[0].permute(1, 2, 0).contiguous()
+                if out_tensor.dtype != target_dtype:
+                    out_tensor = out_tensor.to(dtype=target_dtype)
+                if out_tensor.device != target_device:
+                    out_tensor = out_tensor.to(device=target_device, non_blocking=True)
+                stats["output_format"] = "torch"
+                stats["output_dtype"] = str(out_tensor.dtype)
+                stats["output_device"] = str(out_tensor.device)
+                stats["output_shape"] = list(out_tensor.shape)
+                out = out_tensor.detach()
+            else:
+                out_np = _from_tensor_image(U)
+                stats["output_format"] = "numpy"
+                stats["output_dtype"] = str(out_np.dtype)
+                stats["output_shape"] = list(out_np.shape)
+                out = out_np
             total_ms = (time.perf_counter() - start_all) * 1000.0
             stats["total_ms"] = total_ms
             log_debug("GPU inpaint total: %.3f ms (area=%.2f%%)", total_ms, area_frac * 100.0)
@@ -1181,28 +1438,42 @@ class MeshRender():
 
         # -------- end helpers -----------------------------------------------
 
-        # Normalize incoming texture to numpy float32 [H,W,C] in [0,1]
-        if isinstance(texture, torch.Tensor):
-            texture_np = texture.detach().cpu().numpy()
-        elif isinstance(texture, np.ndarray):
-            texture_np = texture
-        elif isinstance(texture, Image.Image):
-            texture_np = np.array(texture)
-        else:
-            raise ValueError("Unsupported texture type")
-        if texture_np.dtype != np.float32 and texture_np.dtype != np.float64:
-            texture_np = texture_np.astype(np.float32)
-        if texture_np.max() > 1.0:
-            texture_np = texture_np / 255.0
+        # Normalize incoming texture to torch tensor [H,W,C] in [0,1]
+        texture_tensor = _to_texture_tensor(texture, ops_device)
+        tex_h, tex_w, tex_c = texture_tensor.shape
+        info["texture_shape"] = [tex_h, tex_w, tex_c]
 
-        # Gather mesh info and apply existing vertex-space inpaint prep
-        vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
-        texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
-        info["texture_shape"] = list(texture_np.shape)
-        if mask.size:
-            info["mask_hole_frac"] = float(np.count_nonzero(mask == 0)) / float(mask.size)
+        if isinstance(mask, np.ndarray):
+            mask_np = mask
+        else:
+            mask_np = np.array(mask)
+        if mask_np.dtype != np.uint8:
+            mask_np = mask_np.astype(np.uint8)
+        mask_np = np.ascontiguousarray(mask_np)
+        mask_bool = torch.from_numpy(mask_np > 0).to(device=ops_device)
+
+        if mask_np.size:
+            info["mask_hole_frac"] = float(np.count_nonzero(mask_np == 0)) / float(mask_np.size)
         else:
             info["mask_hole_frac"] = 0.0
+
+        # Gather mesh info and apply vertex-space inpaint prep
+        mesh_cache = None
+        vertex_mode = "skip" if skip_vertex else ("gpu" if (gpu_vertex and torch.cuda.is_available()) else "cpu")
+        info["vertex_mode"] = vertex_mode
+        if vertex_mode == "cpu":
+            vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
+            mesh_cache = (vtx_pos, pos_idx, vtx_uv, uv_idx)
+            texture_np = texture_tensor.cpu().numpy()
+            texture_np, mask_np = meshVerticeInpaint(texture_np, mask_np, vtx_pos, vtx_uv, pos_idx, uv_idx)
+            texture_tensor = torch.from_numpy(texture_np).to(device=ops_device, dtype=torch.float32)
+            mask_bool = torch.from_numpy(mask_np > 0).to(device=ops_device)
+        elif vertex_mode == "gpu":
+            texture_tensor, mask_bool, vertex_stats = self._gpu_vertex_inpaint(texture_tensor, mask_bool, ops_device)
+            info.update(vertex_stats)
+            mask_np = (mask_bool.detach().cpu().numpy().astype(np.uint8)) * 255
+        else:  # skip
+            info["vertex_preprocess_skipped"] = True
 
         # Try GPU path first
         use_gpu = (env_gpu_flag == "1") and torch.cuda.is_available()
@@ -1218,9 +1489,12 @@ class MeshRender():
         if use_gpu and method_choice != "cpu":
             try:
                 start_gpu = time.perf_counter()
-                out_np, stats = _gpu_inpaint_auto(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+                if mesh_cache is None:
+                    mesh_cache = self.get_mesh()
+                vtx_pos, pos_idx, vtx_uv, uv_idx = mesh_cache
+                out_val, stats = _gpu_inpaint_auto(texture_tensor, mask_np, vtx_pos, vtx_uv, pos_idx, uv_idx)
                 info.update(stats)
-                if out_np is None:
+                if out_val is None:
                     raise RuntimeError(f"GPU inpaint skipped: {stats.get('skip_reason', 'unknown reason')}")
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -1229,17 +1503,32 @@ class MeshRender():
                 info.setdefault("total_ms", gpu_elapsed)
                 log_debug("uv_inpaint: GPU path completed in %.3f ms", gpu_elapsed)
                 self._last_uv_inpaint_info = info
-                return out_np
+                return out_val
             except Exception as e:
                 info["fallback_reason"] = str(e)
                 logger.exception("GPU inpaint failed; falling back to CPU Telea. Reason: %s", e)
 
         # CPU Telea fallback
         start_cpu = time.perf_counter()
-        out_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_TELEA)
+        texture_np_cpu = texture_tensor.detach().cpu().numpy()
+        out_np = cv2.inpaint((texture_np_cpu * 255).astype(np.uint8), 255 - mask_np, 3, cv2.INPAINT_TELEA)
         cpu_elapsed = (time.perf_counter() - start_cpu) * 1000.0
         info["mode"] = "cpu"
         info["cpu_duration_ms"] = cpu_elapsed
         self._last_uv_inpaint_info = info
         log_debug("uv_inpaint: CPU Telea completed in %.3f ms", cpu_elapsed)
+        if texture_is_tensor:
+            out_np = out_np.astype(np.float32) / 255.0
+            out_t = torch.from_numpy(out_np)
+            if out_t.dtype != target_dtype:
+                out_t = out_t.to(dtype=target_dtype)
+            out_t = out_t.to(device=target_device, non_blocking=(target_device.type == "cuda"))
+            info["output_format"] = "torch"
+            info["output_dtype"] = str(out_t.dtype)
+            info["output_device"] = str(out_t.device)
+            info["output_shape"] = list(out_t.shape)
+            return out_t.contiguous()
+        info["output_format"] = "numpy"
+        info["output_dtype"] = str(out_np.dtype)
+        info["output_shape"] = list(out_np.shape)
         return out_np

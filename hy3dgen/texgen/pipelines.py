@@ -206,16 +206,23 @@ class Hunyuan3DPaintPipeline:
         Inpaint using renderer UV path. Returns a torch tensor on the original device in [0,1].
         Keeps data on-GPU when available and avoids redundant copies.
         """
-        out_np = self.render.uv_inpaint(texture, mask)  # uint8 [H,W,C]
+        out_val = self.render.uv_inpaint(texture, mask)
         if os.getenv("HY3DGEN_INPAINT_DEBUG", "0") == "1":
             info = getattr(self.render, "_last_uv_inpaint_info", None)
             if info is not None:
                 logger.info("texture_inpaint: uv_inpaint stats %s", info)
+        if isinstance(out_val, torch.Tensor):
+            return out_val
         if isinstance(texture, torch.Tensor):
             dev = texture.device
+            dtype = texture.dtype
         else:
             dev = torch.device(self.config.device)
-        return torch.from_numpy(out_np).to(dev, non_blocking=True).float() / 255.0
+            dtype = torch.float32
+        out_t = torch.from_numpy(out_val).to(dev, non_blocking=True).float() / 255.0
+        if out_t.dtype != dtype:
+            out_t = out_t.to(dtype=dtype)
+        return out_t
 
     def recenter_image(self, image, border_ratio=0.2):
         if image.mode == 'RGB':
