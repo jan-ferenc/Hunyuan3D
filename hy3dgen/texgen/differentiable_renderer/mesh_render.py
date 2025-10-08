@@ -283,16 +283,62 @@ class MeshRender():
         self._vertex_cache.clear()
 
     def set_texture(self, tex):
-        if isinstance(tex, np.ndarray):
-            tex = Image.fromarray((tex * 255).astype(np.uint8))
-        elif isinstance(tex, torch.Tensor):
-            tex = tex.cpu().numpy()
-            tex = Image.fromarray((tex * 255).astype(np.uint8))
+        """
+        Store texture data as a float32 tensor on the renderer device.
+        Accepts numpy arrays, PIL images, or torch tensors in either [0, 255] or [0, 1].
+        """
 
-        tex = tex.resize(self.texture_size).convert('RGB')
-        tex = np.array(tex) / 255.0
-        self.tex = torch.from_numpy(tex).to(self.device)
-        self.tex = self.tex.float()
+        target_h, target_w = self.texture_size
+
+        def _to_tensor(input_tex):
+            if isinstance(input_tex, torch.Tensor):
+                tensor = input_tex.detach()
+                if tensor.dim() == 4:
+                    if tensor.shape[0] != 1:
+                        raise ValueError("set_texture expects tensor with shape [H,W,C] or [1,H,W,C]")
+                    tensor = tensor[0]
+                if tensor.dim() != 3:
+                    raise ValueError("set_texture expects tensor with 3 channels in last dimension")
+                tensor = tensor.to(device=self.device)
+                if tensor.dtype in (torch.float16, torch.float32, torch.float64):
+                    tensor = tensor.to(dtype=torch.float32)
+                    if tensor.max().item() > 1.0005:
+                        tensor = tensor / 255.0
+                else:
+                    tensor = tensor.to(dtype=torch.float32) / 255.0
+                return tensor.clamp_(0.0, 1.0)
+            if isinstance(input_tex, Image.Image):
+                array = np.asarray(input_tex)
+            else:
+                array = np.asarray(input_tex)
+            tensor = torch.from_numpy(array).to(device=self.device)
+            if tensor.dtype in (torch.float16, torch.float32, torch.float64):
+                tensor = tensor.to(dtype=torch.float32)
+                if tensor.max().item() > 1.0005:
+                    tensor = tensor / 255.0
+            else:
+                tensor = tensor.to(dtype=torch.float32) / 255.0
+            return tensor.clamp_(0.0, 1.0)
+
+        texture_tensor = _to_tensor(tex)
+        if texture_tensor.dim() != 3 or texture_tensor.shape[-1] not in (3, 4):
+            raise ValueError("set_texture expects an image tensor with shape [H, W, 3/4]")
+        if texture_tensor.shape[-1] == 4:
+            texture_tensor = texture_tensor[..., :3]
+
+        if (texture_tensor.shape[0], texture_tensor.shape[1]) != (target_h, target_w):
+            texture_tensor = texture_tensor.permute(2, 0, 1).unsqueeze(0)
+            texture_tensor = F.interpolate(
+                texture_tensor,
+                size=(target_h, target_w),
+                mode='bilinear',
+                align_corners=False,
+            )
+            texture_tensor = texture_tensor.squeeze(0).permute(1, 2, 0).contiguous()
+        else:
+            texture_tensor = texture_tensor.contiguous()
+
+        self.tex = texture_tensor
 
     def set_default_render_resolution(self, default_resolution):
         if isinstance(default_resolution, int):
@@ -691,11 +737,13 @@ class MeshRender():
                         dim=-1),
             dim=-1)
 
-        vertex_normals = trimesh.geometry.mean_vertex_normals(vertex_count=self.vtx_pos.shape[0],
-                                                              faces=self.pos_idx.cpu(),
-                                                              face_normals=face_normals.cpu(), )
-        vertex_normals = torch.from_numpy(
-            vertex_normals).float().to(self.device).contiguous()
+        faces = self.pos_idx[:, :3]
+        vertex_normals = torch.zeros(
+            (self.vtx_pos.shape[0], 3), device=self.device, dtype=face_normals.dtype
+        )
+        expanded_normals = face_normals.unsqueeze(1).expand(-1, faces.shape[1], -1)
+        vertex_normals.index_add_(0, faces.reshape(-1), expanded_normals.reshape(-1, 3))
+        vertex_normals = F.normalize(vertex_normals, dim=-1, eps=1e-8)
 
         # Interpolate normal values across the rasterized pixels
         normal, _ = self.raster_interpolate(
@@ -1450,17 +1498,43 @@ class MeshRender():
         tex_h, tex_w, tex_c = texture_tensor.shape
         info["texture_shape"] = [tex_h, tex_w, tex_c]
 
-        if isinstance(mask, np.ndarray):
-            mask_np = mask
+        if isinstance(mask, torch.Tensor):
+            mask_tensor = mask.detach()
+            if mask_tensor.dim() == 4:
+                if mask_tensor.shape[0] != 1:
+                    raise ValueError("mask tensor must have shape [H,W], [H,W,1], or [1,H,W,1]")
+                mask_tensor = mask_tensor[0]
+            if mask_tensor.dim() == 3 and mask_tensor.shape[-1] == 1:
+                mask_tensor = mask_tensor[..., 0]
+            if mask_tensor.dim() != 2:
+                raise ValueError("mask tensor must be 2D after squeezing")
+            mask_tensor = mask_tensor.to(device=ops_device)
+            if mask_tensor.dtype == torch.bool:
+                mask_bool = mask_tensor
+            elif mask_tensor.dtype.is_floating_point:
+                mask_bool = mask_tensor > 0.5
+            else:
+                mask_bool = mask_tensor != 0
+            mask_u8 = (mask_bool.detach().cpu().numpy().astype(np.uint8)) * 255
         else:
-            mask_np = np.array(mask)
-        if mask_np.dtype != np.uint8:
-            mask_np = mask_np.astype(np.uint8)
-        mask_np = np.ascontiguousarray(mask_np)
-        mask_bool = torch.from_numpy(mask_np > 0).to(device=ops_device)
+            mask_array = np.asarray(mask)
+            if mask_array.ndim == 3 and mask_array.shape[-1] == 1:
+                mask_array = mask_array[..., 0]
+            if mask_array.ndim != 2:
+                raise ValueError("mask array must be 2D")
+            if mask_array.dtype == np.bool_:
+                mask_bool_np = mask_array
+            else:
+                mask_bool_np = mask_array > 0
+            mask_u8 = (mask_bool_np.astype(np.uint8)) * 255
+            mask_bool = torch.from_numpy(mask_bool_np).to(device=ops_device)
 
-        if mask_np.size:
-            info["mask_hole_frac"] = float(np.count_nonzero(mask_np == 0)) / float(mask_np.size)
+        mask_u8 = np.ascontiguousarray(mask_u8)
+
+        total_texels = mask_bool.numel()
+        if total_texels:
+            known_texels = mask_bool.sum().item()
+            info["mask_hole_frac"] = float(total_texels - known_texels) / float(total_texels)
         else:
             info["mask_hole_frac"] = 0.0
 
@@ -1478,13 +1552,15 @@ class MeshRender():
             vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
             mesh_cache = (vtx_pos, pos_idx, vtx_uv, uv_idx)
             texture_np = texture_tensor.cpu().numpy()
-            texture_np, mask_np = meshVerticeInpaint(texture_np, mask_np, vtx_pos, vtx_uv, pos_idx, uv_idx)
+            texture_np, mask_np = meshVerticeInpaint(texture_np, mask_u8, vtx_pos, vtx_uv, pos_idx, uv_idx)
             texture_tensor = torch.from_numpy(texture_np).to(device=ops_device, dtype=torch.float32)
             mask_bool = torch.from_numpy(mask_np > 0).to(device=ops_device)
+            mask_u8 = np.ascontiguousarray(mask_np)
         elif vertex_mode == "gpu":
             texture_tensor, mask_bool, vertex_stats = self._gpu_vertex_inpaint(texture_tensor, mask_bool, ops_device)
             info.update(vertex_stats)
-            mask_np = (mask_bool.detach().cpu().numpy().astype(np.uint8)) * 255
+            mask_u8 = (mask_bool.detach().cpu().numpy().astype(np.uint8)) * 255
+            mask_u8 = np.ascontiguousarray(mask_u8)
         else:  # skip
             info["vertex_preprocess_skipped"] = True
 
@@ -1505,7 +1581,7 @@ class MeshRender():
                 if mesh_cache is None:
                     mesh_cache = self.get_mesh()
                 vtx_pos, pos_idx, vtx_uv, uv_idx = mesh_cache
-                out_val, stats = _gpu_inpaint_auto(texture_tensor, mask_np, vtx_pos, vtx_uv, pos_idx, uv_idx)
+                out_val, stats = _gpu_inpaint_auto(texture_tensor, mask_u8, vtx_pos, vtx_uv, pos_idx, uv_idx)
                 info.update(stats)
                 if out_val is None:
                     raise RuntimeError(f"GPU inpaint skipped: {stats.get('skip_reason', 'unknown reason')}")
@@ -1524,7 +1600,7 @@ class MeshRender():
         # CPU Telea fallback
         start_cpu = time.perf_counter()
         texture_np_cpu = texture_tensor.detach().cpu().numpy()
-        out_np = cv2.inpaint((texture_np_cpu * 255).astype(np.uint8), 255 - mask_np, 3, cv2.INPAINT_TELEA)
+        out_np = cv2.inpaint((texture_np_cpu * 255).astype(np.uint8), 255 - mask_u8, 3, cv2.INPAINT_TELEA)
         cpu_elapsed = (time.perf_counter() - start_cpu) * 1000.0
         info["mode"] = "cpu"
         info["cpu_duration_ms"] = cpu_elapsed

@@ -12,19 +12,12 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
-import hashlib
 import logging
-import os
 import threading
-from collections import OrderedDict
 
 import numpy as np
 import trimesh
 import xatlas
-
-UV_CACHE: "OrderedDict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
-UV_CACHE_SIZE = int(os.environ.get('HY3DGEN_UV_CACHE_SIZE', 8))
-UV_CACHE_LOCK = threading.Lock()
 
 
 class _AtlasWrapper:
@@ -45,14 +38,6 @@ class _AtlasWrapper:
 _ATLAS = _AtlasWrapper()
 
 
-def _hash_mesh(mesh: trimesh.Trimesh) -> str:
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    faces = np.asarray(mesh.faces, dtype=np.int32)
-    digest = hashlib.sha1(vertices.tobytes())
-    digest.update(faces.tobytes())
-    return digest.hexdigest()
-
-
 def mesh_uv_wrap(mesh):
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.dump(concatenate=True)
@@ -66,31 +51,6 @@ def mesh_uv_wrap(mesh):
     if existing_uv is not None and isinstance(hunyuan_meta, dict) and hunyuan_meta.get('uv_wrapped'):
         return mesh
 
-    cache_key = None
-    if isinstance(hunyuan_meta, dict):
-        cache_key = hunyuan_meta.get('uv_cache_key')
-
-    if cache_key is None:
-        try:
-            cache_key = _hash_mesh(mesh)
-        except Exception:
-            cache_key = None
-
-    if cache_key is not None:
-        with UV_CACHE_LOCK:
-            cached = UV_CACHE.get(cache_key)
-            if cached is not None:
-                cached_vertices, cached_faces, cached_uvs = cached
-                mesh.vertices = cached_vertices.copy()
-                mesh.faces = cached_faces.copy()
-                mesh.visual.uv = cached_uvs.copy()
-                hunyuan_meta = metadata.setdefault('hunyuan3d', {})
-                hunyuan_meta['uv_wrapped'] = True
-                hunyuan_meta['uv_cache_key'] = cache_key
-                UV_CACHE.move_to_end(cache_key)
-                mesh.metadata = metadata
-                return mesh
-
     positions = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.uint32)
     vmapping, indices, uvs = _ATLAS.parametrize(positions, faces)
@@ -103,12 +63,6 @@ def mesh_uv_wrap(mesh):
         metadata = {}
     hunyuan_meta = metadata.setdefault('hunyuan3d', {})
     hunyuan_meta['uv_wrapped'] = True
-    if cache_key is not None and UV_CACHE_SIZE > 0:
-        with UV_CACHE_LOCK:
-            UV_CACHE[cache_key] = (mesh.vertices.copy(), mesh.faces.copy(), mesh.visual.uv.copy())
-            while len(UV_CACHE) > UV_CACHE_SIZE:
-                UV_CACHE.popitem(last=False)
-            hunyuan_meta['uv_cache_key'] = cache_key
     mesh.metadata = metadata
 
     return mesh

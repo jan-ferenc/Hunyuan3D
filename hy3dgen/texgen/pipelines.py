@@ -403,10 +403,9 @@ class Hunyuan3DPaintPipeline:
                                                  method=self.config.merge_method)
         logger.debug('Texture baking completed in %.3fs', time.perf_counter() - bake_start)
 
-        mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
-
         inpaint_start = time.perf_counter()
-        texture = self.texture_inpaint(texture, mask_np)
+        mask_tensor = mask.squeeze(-1)
+        texture = self.texture_inpaint(texture, mask_tensor)
         logger.debug('Texture inpaint completed in %.3fs', time.perf_counter() - inpaint_start)
 
         self.render.set_texture(texture)
