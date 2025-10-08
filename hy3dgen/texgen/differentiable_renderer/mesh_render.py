@@ -1335,27 +1335,51 @@ class MeshRender():
             """
             device = U0.device
             _, C, H, W = U0.shape
-            # Ensure known_mask matches U0 spatial size via nearest interpolation
-            if known_mask.shape[-2:] != (H, W):
-                km = known_mask.float()
-                km = F.interpolate(km, size=(H, W), mode='nearest')
-                known_mask = km.bool()
+
+            if known_mask is None:
+                zero_w = torch.zeros((1, 1, H, W), device=device, dtype=torch.float32)
+                zero_t = torch.zeros((1, C, H, W), device=device, dtype=torch.float32)
+                return zero_w, zero_t
+
+            # Normalize known_mask to [1,1,H,W] bool on the correct device.
+            mask = known_mask.to(device)
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)
+            elif mask.dim() == 3:
+                if mask.shape[0] == 1:
+                    mask = mask.unsqueeze(0)
+                else:
+                    mask = mask.unsqueeze(1)
+            elif mask.dim() != 4:
+                raise ValueError(f"known_mask must be 2D-4D, got shape {tuple(mask.shape)}")
+
+            if mask.shape[0] != 1:
+                mask = mask[:1]
+            if mask.shape[1] != 1:
+                mask = mask[:, :1]
+
+            mask_f = mask.float()
+            if mask_f.shape[-2:] != (H, W):
+                mask_f = F.interpolate(mask_f, size=(H, W), mode="nearest")
+            known_mask = mask_f.gt(0.5).contiguous()
             known_f = known_mask.float()  # [1,1,H,W]
 
             # 4-neighbor kernel
-            k4_scalar = torch.tensor([[[[0., 1., 0.],
-                                        [1., 0., 1.],
-                                        [0., 1., 0.]]]], device=device, dtype=torch.float32)
+            k4_scalar = torch.tensor([[[[0.0, 1.0, 0.0],
+                                        [1.0, 0.0, 1.0],
+                                        [0.0, 1.0, 0.0]]]], device=device, dtype=torch.float32)
             cnt4 = F.conv2d(known_f, k4_scalar, padding=1)  # [1,1,H,W]
-            ring = (~known_mask) & (cnt4 > 0)              # [1,1,H,W]
+            ring = (~known_mask) & (cnt4 > 0)  # [1,1,H,W]
             if not ring.any():
                 return torch.zeros_like(cnt4), torch.zeros_like(U0)
 
             U_known = U0 * known_f
             k4_channels = k4_scalar.repeat(C, 1, 3, 3)
             sum4 = F.conv2d(U_known, k4_channels, padding=1, groups=C)  # [1,C,H,W]
-            denom = cnt4.clamp(min=1e-6)                                  # [1,1,H,W]
-            t = sum4 / denom                                               # [1,C,H,W]
+            denom = cnt4.clamp(min=1e-6)
+            if denom.shape[-2:] != sum4.shape[-2:]:
+                denom = F.interpolate(denom, size=sum4.shape[-2:], mode="nearest")
+            t = sum4 / denom  # [1,C,H,W]
             ring_f = ring.to(dtype=torch.float32)
             t = t * ring_f
             w = (denom / 4.0) * float(scale)
